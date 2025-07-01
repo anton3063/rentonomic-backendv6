@@ -1,15 +1,15 @@
-from fastapi import FastAPI, Request, UploadFile, File, Form
+from fastapi import FastAPI, UploadFile, File, Form
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
-import psycopg2
 import cloudinary
 import cloudinary.uploader
+import psycopg2
 import uuid
 import os
 
 app = FastAPI()
 
-# CORS configuration
+# CORS config
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[
@@ -24,77 +24,70 @@ app.add_middleware(
 
 # Cloudinary config
 cloudinary.config(
-    cloud_name="dxfu0e4qa",
-    api_key="877465556446563",
-    api_secret="DQUOrjArLXt3JYtt2xvLjPDoUkA"
+    cloud_name="rentonomic",
+    api_key="726146152152631",
+    api_secret="3ixdoYJKW8KRqx8HRD0s5CQHxj8",
 )
 
-# Railway PostgreSQL config
-DB_URL = "postgresql://postgres:UoiETFVckuSWSjGMLjjJnXNLgsUfwFKd@switchback.proxy.rlwy.net:27985/railway"
+# PostgreSQL config
+DATABASE_URL = "postgresql://postgres:UoiETFVckuSWSjGMLjjJnXNLgsUfwFKd@switchback.proxy.rlwy.net:27985/railway"
 
-# Create listings table if not exists
-def create_table():
-    conn = psycopg2.connect(DB_URL)
-    cur = conn.cursor()
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS listings (
-            id UUID PRIMARY KEY,
-            title TEXT,
-            location TEXT,
-            description TEXT,
-            price_per_day NUMERIC,
-            image_url TEXT
-        );
-    """)
-    conn.commit()
-    cur.close()
-    conn.close()
+def get_connection():
+    return psycopg2.connect(DATABASE_URL)
 
-create_table()
-
-@app.get("/listings")
-def get_listings():
-    conn = psycopg2.connect(DB_URL)
-    cur = conn.cursor()
-    cur.execute("SELECT * FROM listings;")
-    rows = cur.fetchall()
-    cur.close()
-    conn.close()
-    listings = []
-    for row in rows:
-        listings.append({
-            "id": str(row[0]),
-            "title": row[1],
-            "location": row[2],
-            "description": row[3],
-            "price_per_day": float(row[4]),
-            "image_url": row[5]
-        })
-    return listings
+@app.post("/upload-image")
+async def upload_image(file: UploadFile = File(...)):
+    try:
+        result = cloudinary.uploader.upload(file.file)
+        return {"image_url": result["secure_url"]}
+    except Exception as e:
+        return JSONResponse(status_code=500, content={"error": str(e)})
 
 @app.post("/listing")
 async def create_listing(
-    title: str = Form(...),
+    name: str = Form(...),
     location: str = Form(...),
     description: str = Form(...),
     price_per_day: float = Form(...),
-    image: UploadFile = File(...)
+    image_url: str = Form(...)
 ):
     try:
-        upload_result = cloudinary.uploader.upload(image.file)
-        image_url = upload_result["secure_url"]
-
-        conn = psycopg2.connect(DB_URL)
+        conn = get_connection()
         cur = conn.cursor()
         listing_id = str(uuid.uuid4())
-        cur.execute("""
-            INSERT INTO listings (id, title, location, description, price_per_day, image_url)
-            VALUES (%s, %s, %s, %s, %s, %s);
-        """, (listing_id, title, location, description, price_per_day, image_url))
+        cur.execute(
+            "INSERT INTO listings (id, name, location, description, price_per_day, image_url) VALUES (%s, %s, %s, %s, %s, %s)",
+            (listing_id, name, location, description, price_per_day, image_url)
+        )
         conn.commit()
         cur.close()
         conn.close()
-
-        return JSONResponse(content={"message": "Listing created successfully."})
+        return {"message": "Listing created"}
     except Exception as e:
         return JSONResponse(status_code=500, content={"error": str(e)})
+
+@app.get("/listings")
+def get_listings():
+    try:
+        conn = get_connection()
+        cur = conn.cursor()
+        cur.execute("SELECT name, location, description, price_per_day, image_url FROM listings ORDER BY id DESC")
+        rows = cur.fetchall()
+        cur.close()
+        conn.close()
+
+        listings = [
+            {
+                "name": row[0],
+                "location": row[1],
+                "description": row[2],
+                "price_per_day": row[3],
+                "image_url": row[4],
+            }
+            for row in rows
+        ]
+
+        return listings
+    except Exception as e:
+        return JSONResponse(status_code=500, content={"error": str(e)})
+
