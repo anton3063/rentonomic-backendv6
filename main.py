@@ -1,22 +1,18 @@
 from fastapi import FastAPI, UploadFile, File, Form
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
 import cloudinary
 import cloudinary.uploader
 import psycopg2
-import uuid
 import os
+from dotenv import load_dotenv
+
+load_dotenv()
 
 app = FastAPI()
 
-# CORS config
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[
-        "https://rentonomic.com",
-        "https://www.rentonomic.com",
-        "https://rentonomic.netlify.app"
-    ],
+    allow_origins=["https://rentonomic.com", "https://www.rentonomic.com", "https://rentonomic.netlify.app"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -24,70 +20,75 @@ app.add_middleware(
 
 # Cloudinary config
 cloudinary.config(
-    cloud_name="rentonomic",
-    api_key="726146152152631",
-    api_secret="3ixdoYJKW8KRqx8HRD0s5CQHxj8",
+    cloud_name=os.getenv("CLOUDINARY_CLOUD_NAME"),
+    api_key=os.getenv("CLOUDINARY_API_KEY"),
+    api_secret=os.getenv("CLOUDINARY_API_SECRET"),
 )
 
 # PostgreSQL config
-DATABASE_URL = "postgresql://postgres:UoiETFVckuSWSjGMLjjJnXNLgsUfwFKd@switchback.proxy.rlwy.net:27985/railway"
+DATABASE_URL = os.getenv("DATABASE_URL")
 
-def get_connection():
-    return psycopg2.connect(DATABASE_URL)
-
-@app.post("/upload-image")
-async def upload_image(file: UploadFile = File(...)):
-    try:
-        result = cloudinary.uploader.upload(file.file)
-        return {"image_url": result["secure_url"]}
-    except Exception as e:
-        return JSONResponse(status_code=500, content={"error": str(e)})
+@app.get("/")
+def read_root():
+    return {"message": "Rentonomic backend running!"}
 
 @app.post("/listing")
 async def create_listing(
-    name: str = Form(...),
+    title: str = Form(...),
     location: str = Form(...),
     description: str = Form(...),
     price_per_day: float = Form(...),
-    image_url: str = Form(...)
+    image: UploadFile = File(...)
 ):
     try:
-        conn = get_connection()
+        # Upload image to Cloudinary
+        upload_result = cloudinary.uploader.upload(image.file)
+        image_url = upload_result.get("secure_url")
+
+        conn = psycopg2.connect(DATABASE_URL)
         cur = conn.cursor()
-        listing_id = str(uuid.uuid4())
-        cur.execute(
-            "INSERT INTO listings (id, name, location, description, price_per_day, image_url) VALUES (%s, %s, %s, %s, %s, %s)",
-            (listing_id, name, location, description, price_per_day, image_url)
-        )
+
+        cur.execute("""
+            INSERT INTO listings (title, location, description, price_per_day, image_url)
+            VALUES (%s, %s, %s, %s, %s)
+        """, (title, location, description, price_per_day, image_url))
+
         conn.commit()
         cur.close()
         conn.close()
-        return {"message": "Listing created"}
+
+        return {"message": "Listing created successfully", "image_url": image_url}
     except Exception as e:
-        return JSONResponse(status_code=500, content={"error": str(e)})
+        return {"error": str(e)}
 
 @app.get("/listings")
 def get_listings():
     try:
-        conn = get_connection()
+        conn = psycopg2.connect(DATABASE_URL)
         cur = conn.cursor()
-        cur.execute("SELECT name, location, description, price_per_day, image_url FROM listings ORDER BY id DESC")
-        rows = cur.fetchall()
+
+        cur.execute("SELECT title, location, description, price_per_day, image_url FROM listings")
+        listings = cur.fetchall()
+
         cur.close()
         conn.close()
 
-        listings = [
+        return [
             {
-                "name": row[0],
+                "title": row[0],
                 "location": row[1],
                 "description": row[2],
                 "price_per_day": row[3],
                 "image_url": row[4],
             }
-            for row in rows
+            for row in listings
         ]
-
-        return listings
     except Exception as e:
-        return JSONResponse(status_code=500, content={"error": str(e)})
+        return {"error": str(e)}
+
+# ✅ Ensure Railway sees the correct entry point
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run("main:app", host="0.0.0.0", port=8080)
+
 
