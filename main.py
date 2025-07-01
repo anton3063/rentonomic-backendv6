@@ -6,7 +6,6 @@ import psycopg2
 
 app = FastAPI()
 
-# CORS config
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[
@@ -19,16 +18,10 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# PostgreSQL connection
 conn = psycopg2.connect(
-    host="switchback.proxy.rlwy.net",
-    port=27985,
-    dbname="railway",
-    user="postgres",
-    password="Concrete-0113xyz"
+    "postgresql://postgres:UoiETFVckuSWSjGMLjjJnXNLgsUfwFKd@switchback.proxy.rlwy.net:27985/railway"
 )
 
-# Cloudinary config
 cloudinary.config(
     cloud_name="dzd5v9ggu",
     api_key="815282963778522",
@@ -78,6 +71,7 @@ def get_listings():
         return listings
     except Exception as e:
         return JSONResponse(status_code=500, content={"error": str(e)})
+
 
 
 
