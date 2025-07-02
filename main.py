@@ -3,6 +3,23 @@ import psycopg2
 
 DATABASE_URL = os.getenv("DATABASE_URL")
 
+if DATABASE_URL is None:
+    raise RuntimeError("DATABASE_URL environment variable not set")
+
+# Strip trailing whitespace/newlines:
+DATABASE_URL = DATABASE_URL.strip()
+
+print(f"DEBUG: DATABASE_URL is: {repr(DATABASE_URL)}")
+
+try:
+    conn = psycopg2.connect(DATABASE_URL)
+except Exception as e:
+    raise RuntimeError(f"Error connecting to the database: {e}")
+import os
+import psycopg2
+
+DATABASE_URL = os.getenv("DATABASE_URL")
+
 print(f"DEBUG: DATABASE_URL is: {repr(DATABASE_URL)}")
 
 try:
