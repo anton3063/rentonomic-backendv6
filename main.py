@@ -1,4 +1,15 @@
 import os
+import psycopg2
+
+DATABASE_URL = os.getenv("DATABASE_URL")
+
+print(f"DEBUG: DATABASE_URL is: {repr(DATABASE_URL)}")
+
+try:
+    conn = psycopg2.connect(DATABASE_URL)
+except Exception as e:
+    raise RuntimeError(f"Error connecting to the database: {e}")
+import os
 print("DATABASE_URL raw value:")
 print(repr(os.getenv("DATABASE_URL")))
 from fastapi import FastAPI, HTTPException
