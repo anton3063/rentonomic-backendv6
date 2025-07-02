@@ -1,47 +1,4 @@
-@app.get("/debug-env")
-async def debug_env():
-    def show_whitespace(s):
-        # Replace spaces with [space], newlines with [\\n], tabs with [\\t] for visibility
-        return s.replace(" ", "[space]").replace("\n", "[\\n]").replace("\t", "[\\t]")
-    
-    return {
-        "DATABASE_URL": show_whitespace(os.getenv("DATABASE_URL") or ""),
-        "CLOUDINARY_CLOUD_NAME": show_whitespace(os.getenv("CLOUDINARY_CLOUD_NAME") or ""),
-        "CLOUDINARY_API_KEY": show_whitespace(os.getenv("CLOUDINARY_API_KEY") or ""),
-        "CLOUDINARY_API_SECRET": show_whitespace(os.getenv("CLOUDINARY_API_SECRET") or ""),
-    }
-import os
-import psycopg2
-
-DATABASE_URL = os.getenv("DATABASE_URL")
-
-if DATABASE_URL is None:
-    raise RuntimeError("DATABASE_URL environment variable not set")
-
-# Strip trailing whitespace/newlines:
-DATABASE_URL = DATABASE_URL.strip()
-
-print(f"DEBUG: DATABASE_URL is: {repr(DATABASE_URL)}")
-
-try:
-    conn = psycopg2.connect(DATABASE_URL)
-except Exception as e:
-    raise RuntimeError(f"Error connecting to the database: {e}")
-import os
-import psycopg2
-
-DATABASE_URL = os.getenv("DATABASE_URL")
-
-print(f"DEBUG: DATABASE_URL is: {repr(DATABASE_URL)}")
-
-try:
-    conn = psycopg2.connect(DATABASE_URL)
-except Exception as e:
-    raise RuntimeError(f"Error connecting to the database: {e}")
-import os
-print("DATABASE_URL raw value:")
-print(repr(os.getenv("DATABASE_URL")))
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 import os
 import psycopg2
@@ -52,13 +9,17 @@ app = FastAPI()
 # CORS setup (adjust origins as needed)
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["https://rentonomic.com", "https://www.rentonomic.com", "https://rentonomic.netlify.app"],
+    allow_origins=[
+        "https://rentonomic.com",
+        "https://www.rentonomic.com",
+        "https://rentonomic.netlify.app",
+    ],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# Check required environment variables
+# Environment variables
 DATABASE_URL = os.getenv("DATABASE_URL")
 CLOUDINARY_CLOUD_NAME = os.getenv("CLOUDINARY_CLOUD_NAME")
 CLOUDINARY_API_KEY = os.getenv("CLOUDINARY_API_KEY")
@@ -79,7 +40,8 @@ cloudinary.config(
 
 # Connect to Postgres database
 try:
-    conn = psycopg2.connect(DATABASE_URL)
+    # Strip whitespace to avoid hidden newline issues
+    conn = psycopg2.connect(DATABASE_URL.strip())
 except Exception as e:
     raise RuntimeError(f"Error connecting to the database: {e}")
 
@@ -87,12 +49,19 @@ except Exception as e:
 async def root():
     return {"message": "Rentonomic backend is running"}
 
-# Add your other API endpoints here, e.g., listings, uploads, etc.
+@app.get("/debug-env")
+async def debug_env():
+    def show_whitespace(s):
+        return s.replace(" ", "[space]").replace("\n", "[\\n]").replace("\t", "[\\t]")
+    return {
+        "DATABASE_URL": show_whitespace(DATABASE_URL or ""),
+        "CLOUDINARY_CLOUD_NAME": show_whitespace(CLOUDINARY_CLOUD_NAME or ""),
+        "CLOUDINARY_API_KEY": show_whitespace(CLOUDINARY_API_KEY or ""),
+        "CLOUDINARY_API_SECRET": show_whitespace(CLOUDINARY_API_SECRET or ""),
+    }
 
-# Example:
-@app.get("/health")
-async def health_check():
-    return {"status": "ok"}
+# Add other endpoints below as needed
+
 
 
 
