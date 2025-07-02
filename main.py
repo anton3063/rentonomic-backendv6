@@ -1,3 +1,15 @@
+@app.get("/debug-env")
+async def debug_env():
+    def show_whitespace(s):
+        # Replace spaces with [space], newlines with [\\n], tabs with [\\t] for visibility
+        return s.replace(" ", "[space]").replace("\n", "[\\n]").replace("\t", "[\\t]")
+    
+    return {
+        "DATABASE_URL": show_whitespace(os.getenv("DATABASE_URL") or ""),
+        "CLOUDINARY_CLOUD_NAME": show_whitespace(os.getenv("CLOUDINARY_CLOUD_NAME") or ""),
+        "CLOUDINARY_API_KEY": show_whitespace(os.getenv("CLOUDINARY_API_KEY") or ""),
+        "CLOUDINARY_API_SECRET": show_whitespace(os.getenv("CLOUDINARY_API_SECRET") or ""),
+    }
 import os
 import psycopg2
 
