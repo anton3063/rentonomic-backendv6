@@ -1,3 +1,6 @@
+import os
+print("DATABASE_URL raw value:")
+print(repr(os.getenv("DATABASE_URL")))
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 import os
