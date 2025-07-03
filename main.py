@@ -1,28 +1,31 @@
 from fastapi import FastAPI
-from fastapi.middleware.cors import CORSMiddleware
+import os
+import logging
+import psycopg2
+
+logging.basicConfig(level=logging.DEBUG)
 
 app = FastAPI()
 
-# Configure CORS to allow your frontend origins - adjust these URLs to your frontend domains
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=[
-        "https://rentonomic.com",
-        "https://www.rentonomic.com",
-        "https://rentonomic.netlify.app",
-    ],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
+
+logging.debug(f"DATABASE_URL: {repr(DATABASE_URL)}")
+
+try:
+    conn = psycopg2.connect(DATABASE_URL)
+    logging.debug("Database connection successful")
+except Exception as e:
+    logging.error(f"Database connection failed: {e}")
+    raise
 
 @app.get("/")
 async def root():
     return {"message": "Rentonomic backend is running"}
 
 @app.get("/health")
-async def health():
+async def health_check():
     return {"status": "ok"}
+
 
 
 
