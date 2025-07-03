@@ -1,55 +1,57 @@
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-import os
-import psycopg2
-import cloudinary
 
 app = FastAPI()
 
-# Setup CORS - add your frontend URLs here
+# Adjust allow_origins to your frontend URL(s)
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["https://rentonomic.com", "https://www.rentonomic.com", "https://rentonomic.netlify.app"],
+    allow_origins=[
+        "https://rentonomic.com",
+        "https://www.rentonomic.com",
+        "https://rentonomic.netlify.app"
+    ],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# Load environment variables
-DATABASE_URL = os.getenv("DATABASE_URL")
-CLOUDINARY_CLOUD_NAME = os.getenv("CLOUDINARY_CLOUD_NAME")
-CLOUDINARY_API_KEY = os.getenv("CLOUDINARY_API_KEY")
-CLOUDINARY_API_SECRET = os.getenv("CLOUDINARY_API_SECRET")
+# Sample listings data to return
+sample_listings = [
+    {
+        "id": 1,
+        "title": "Cordless Drill",
+        "description": "Powerful cordless drill, great for home projects.",
+        "location": "YO8",
+        "price_per_day": 10,
+        "image_url": "https://via.placeholder.com/300x200?text=Drill"
+    },
+    {
+        "id": 2,
+        "title": "Lawn Mower",
+        "description": "Reliable electric lawn mower for your garden.",
+        "location": "YO7",
+        "price_per_day": 15,
+        "image_url": "https://via.placeholder.com/300x200?text=Lawn+Mower"
+    },
+    {
+        "id": 3,
+        "title": "Camera Tripod",
+        "description": "Sturdy tripod for photography or video recording.",
+        "location": "YO8",
+        "price_per_day": 7,
+        "image_url": "https://via.placeholder.com/300x200?text=Tripod"
+    }
+]
 
-# Debug prints (remove or comment out in production)
-print(f"DEBUG: DATABASE_URL: {DATABASE_URL}")
-print(f"DEBUG: CLOUDINARY_CLOUD_NAME: {CLOUDINARY_CLOUD_NAME}")
+@app.get("/")
+async def root():
+    return {"message": "Rentonomic backend is running"}
 
-# Connect to the database
-try:
-    conn = psycopg2.connect(DATABASE_URL)
-    print("DEBUG: Database connection successful")
-except Exception as e:
-    raise RuntimeError(f"Error connecting to the database: {e}")
+@app.get("/listings")
+async def get_listings():
+    return sample_listings
 
-# Configure Cloudinary
-cloudinary.config(
-    cloud_name=CLOUDINARY_CLOUD_NAME,
-    api_key=CLOUDINARY_API_KEY,
-    api_secret=CLOUDINARY_API_SECRET,
-)
-
-@app.get("/health")
-async def health():
-    return {"status": "ok"}
-
-@app.get("/debug-env")
-async def debug_env():
-    # Return key env vars for debugging (avoid returning secrets here in production)
-    return {
-        "DATABASE_URL": DATABASE_URL,
-        "CLOUDINARY_CLOUD_NAME": CLOUDINARY_CLOUD_NAME,
-        "CLOUDINARY_API_KEY": CLOUDINARY_API_KEY,
     }
 
 
