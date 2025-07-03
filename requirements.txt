@@ -1,8 +1,8 @@
-fastapi                  # Web framework for building APIs
-uvicorn[standard]        # ASGI server with recommended extras for production
-python-multipart         # For handling file uploads in FastAPI
-psycopg2-binary          # PostgreSQL adapter for Python
-cloudinary               # Cloudinary Python SDK for image uploads/management
+fastapi                  
+uvicorn[standard]        
+python-multipart         
+psycopg2-binary          
+cloudinary               
 
 
 
