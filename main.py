@@ -3,18 +3,20 @@ from fastapi.middleware.cors import CORSMiddleware
 
 app = FastAPI()
 
+# CORS - allow your frontend domains
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[
         "https://rentonomic.com",
         "https://www.rentonomic.com",
-        "https://rentonomic.netlify.app"
+        "https://rentonomic.netlify.app",
     ],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
+# Sample listings data - replace with your database fetch later
 sample_listings = [
     {
         "id": 1,
@@ -49,6 +51,7 @@ async def root():
 @app.get("/listings")
 async def get_listings():
     return sample_listings
+
 
 
 
