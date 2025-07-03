@@ -1,9 +1,10 @@
 fastapi
-uvicorn[standard]
-psycopg2-binary
+uvicorn
 python-multipart
+psycopg2-binary
 cloudinary
-requests
+python-dotenv
+
 
 
 
