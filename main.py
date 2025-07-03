@@ -3,7 +3,6 @@ from fastapi.middleware.cors import CORSMiddleware
 
 app = FastAPI()
 
-# CORS settings — adjust these to your actual frontend URLs
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[
@@ -16,7 +15,6 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Sample listings data
 sample_listings = [
     {
         "id": 1,
@@ -51,6 +49,7 @@ async def root():
 @app.get("/listings")
 async def get_listings():
     return sample_listings
+
 
 
 
