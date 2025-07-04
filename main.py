@@ -1,38 +1,32 @@
+import os
+import psycopg2
+from psycopg2 import OperationalError
 from fastapi import FastAPI
-from fastapi.middleware.cors import CORSMiddleware
 
 app = FastAPI()
 
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=[
-        "https://rentonomic.com",
-        "https://www.rentonomic.com",
-        "https://rentonomic.netlify.app"
-    ],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+def test_db_connection():
+    db_url = os.getenv("DATABASE_URL")
+    try:
+        conn = psycopg2.connect(db_url)
+        conn.close()
+        print("✅ Database connection successful!")
+    except OperationalError as e:
+        print(f"❌ Database connection failed: {e}")
 
-sample_listings = [
-    {
-        "id": 1,
-        "title": "Cordless Drill",
-        "description": "Powerful cordless drill, great for home projects.",
-        "location": "YO8",
-        "price_per_day": 10,
-        "image_url": "https://via.placeholder.com/300x200?text=Drill"
-    }
-]
+test_db_connection()
+
+# Your existing API routes below
 
 @app.get("/")
-async def root():
-    return {"message": "Rentonomic backend is running"}
+def read_root():
+    return {"message": "Hello from Rentonomic backend!"}
 
+# Example listings route (adjust or replace with your actual code)
 @app.get("/listings")
-async def get_listings():
-    return sample_listings
+def get_listings():
+    return {"listings": []}  # Replace with actual DB query and response
+
 
 
 
