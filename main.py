@@ -1,38 +1,90 @@
-from fastapi import FastAPI
-import psycopg2
 import os
-import sys
-import traceback
+from fastapi import FastAPI, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
+import psycopg2
+import cloudinary
 
 app = FastAPI()
 
-# Read DATABASE_URL from env var
+# CORS - allow your frontend domains
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=[
+        "https://rentonomic.com",
+        "https://www.rentonomic.com",
+        "https://rentonomic.netlify.app",
+    ],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# Load env vars (optional - if using .env locally)
+from dotenv import load_dotenv
+load_dotenv()
+
 DATABASE_URL = os.getenv("DATABASE_URL")
+CLOUDINARY_CLOUD_NAME = os.getenv("CLOUDINARY_CLOUD_NAME")
+CLOUDINARY_API_KEY = os.getenv("CLOUDINARY_API_KEY")
+CLOUDINARY_API_SECRET = os.getenv("CLOUDINARY_API_SECRET")
 
-db_connection = None
-db_error = None
+# Check environment variables
+if not DATABASE_URL:
+    raise RuntimeError("DATABASE_URL environment variable is missing")
 
-@app.on_event("startup")
-async def startup_event():
-    global db_connection, db_error
-    try:
-        db_connection = psycopg2.connect(DATABASE_URL)
-        db_error = None
-        print("✅ Database connection successful")
-    except Exception as e:
-        db_error = str(e)
-        print("❌ Database connection failed:")
-        traceback.print_exc()
+if not all([CLOUDINARY_CLOUD_NAME, CLOUDINARY_API_KEY, CLOUDINARY_API_SECRET]):
+    raise RuntimeError("Cloudinary environment variables are not set properly")
+
+# Configure Cloudinary
+cloudinary.config(
+    cloud_name=CLOUDINARY_CLOUD_NAME,
+    api_key=CLOUDINARY_API_KEY,
+    api_secret=CLOUDINARY_API_SECRET,
+)
+
+# Test DB connection once on startup
+try:
+    conn = psycopg2.connect(DATABASE_URL)
+    conn.close()
+except Exception as e:
+    raise RuntimeError(f"Cannot connect to DB: {e}")
+
+# Sample listings — replace with DB fetch later
+sample_listings = [
+    {
+        "id": 1,
+        "title": "Cordless Drill",
+        "description": "Powerful cordless drill, great for home projects.",
+        "location": "YO8",
+        "price_per_day": 10,
+        "image_url": "https://via.placeholder.com/300x200?text=Drill"
+    },
+    {
+        "id": 2,
+        "title": "Lawn Mower",
+        "description": "Reliable electric lawn mower for your garden.",
+        "location": "YO7",
+        "price_per_day": 15,
+        "image_url": "https://via.placeholder.com/300x200?text=Lawn+Mower"
+    },
+    {
+        "id": 3,
+        "title": "Camera Tripod",
+        "description": "Sturdy tripod for photography or video recording.",
+        "location": "YO8",
+        "price_per_day": 7,
+        "image_url": "https://via.placeholder.com/300x200?text=Tripod"
+    }
+]
 
 @app.get("/")
 async def root():
-    if db_error:
-        return {"status": "error", "detail": "DB connection failed", "error": db_error}
-    return {"status": "ok", "detail": "Backend and DB connected"}
+    return {"message": "Rentonomic backend is running"}
 
-@app.get("/python-version")
-async def python_version():
-    return {"version": sys.version}
+@app.get("/listings")
+async def get_listings():
+    return sample_listings
+
 
 
 
