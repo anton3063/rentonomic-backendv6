@@ -1,8 +1,11 @@
-fastapi                  
-uvicorn[standard]        
-python-multipart         
-psycopg2-binary          
-cloudinary               
+fastapi
+uvicorn
+psycopg2-binary
+python-multipart
+cloudinary
+python-dotenv
+
+              
 
 
 
