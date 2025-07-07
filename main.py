@@ -1,15 +1,12 @@
-from fastapi import FastAPI, File, Form, UploadFile
+from fastapi import FastAPI, UploadFile, File, Form
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 import psycopg2
-import cloudinary
 import cloudinary.uploader
-import os
-import uuid
 
+# === CONFIG ===
 app = FastAPI()
 
-# CORS FIX 🚨
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[
@@ -22,49 +19,68 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Cloudinary setup ✅
+# === CLOUDINARY ===
 cloudinary.config(
-    cloud_name="dxuik8b3e",
-    api_key="583579498246553",
-    api_secret="tBCf2s1I_iR_c0RXuPQ2QDHwzT8"
+    cloud_name="drr5ejtqn",
+    api_key="844936237367879",
+    api_secret="dvfIUZ4It9Qpp6EqMEnNPsmZcsk"
 )
 
-# Database setup ✅
-DATABASE_URL = "postgresql://postgres:Concrete-0113xyz@monorail.proxy.rlwy.net:49077/railway"
+# === POSTGRES ===
+conn = psycopg2.connect(
+    host="ep-falling-boat-a58bgdmr.eu-central-1.pg.koyeb.app",
+    database="rentonomic",
+    user="rentonomic_owner",
+    password="Concrete-0113xyz"
+)
+cur = conn.cursor()
 
-@app.post("/listing")
+# === ENDPOINTS ===
+
+@app.get("/")
+def home():
+    return {"message": "Backend is live"}
+
+@app.get("/listings")
+def get_listings():
+    cur.execute("SELECT id, title, location, description, price, image_url FROM listings ORDER BY id DESC")
+    rows = cur.fetchall()
+    listings = []
+    for row in rows:
+        listings.append({
+            "id": row[0],
+            "title": row[1],
+            "location": row[2],
+            "description": row[3],
+            "price": row[4],
+            "image_url": row[5]
+        })
+    return listings
+
+@app.post("/listings")
 async def create_listing(
     title: str = Form(...),
     location: str = Form(...),
     description: str = Form(...),
-    price: float = Form(...),
+    price: str = Form(...),
     image: UploadFile = File(...)
 ):
     try:
-        # Upload to Cloudinary ✅
-        public_id = f"rentonomic/{uuid.uuid4()}"
-        result = cloudinary.uploader.upload(image.file, public_id=public_id)
+        result = cloudinary.uploader.upload(image.file)
         image_url = result["secure_url"]
-
-        # Insert into PostgreSQL ✅
-        conn = psycopg2.connect(DATABASE_URL)
-        cur = conn.cursor()
-        cur.execute("""
-            INSERT INTO listings (title, location, description, price_per_day, image_url)
-            VALUES (%s, %s, %s, %s, %s)
-        """, (title, location, description, price, image_url))
-        conn.commit()
-        cur.close()
-        conn.close()
-
-        return JSONResponse(content={"message": "Listing created successfully"})
-
     except Exception as e:
-        return JSONResponse(content={"error": str(e)}, status_code=500)
+        return JSONResponse(status_code=500, content={"error": f"Image upload failed: {str(e)}"})
 
-@app.get("/")
-def root():
-    return {"status": "Backend is running"}
+    try:
+        cur.execute(
+            "INSERT INTO listings (title, location, description, price, image_url) VALUES (%s, %s, %s, %s, %s)",
+            (title, location, description, price, image_url)
+        )
+        conn.commit()
+        return {"message": "Listing created successfully"}
+    except Exception as e:
+        return JSONResponse(status_code=500, content={"error": f"Database error: {str(e)}"})
+
 
 
 
