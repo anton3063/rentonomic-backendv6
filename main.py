@@ -1,53 +1,37 @@
-from fastapi import FastAPI, Form, File, UploadFile
+from fastapi import FastAPI, File, Form, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
-import os
 import psycopg2
+import cloudinary
 import cloudinary.uploader
-from uuid import uuid4
+import os
+import uuid
 
-# Initialize app
 app = FastAPI()
 
-# CORS setup
+# CORS FIX 🚨
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[
         "https://rentonomic.com",
         "https://www.rentonomic.com",
-        "https://rentonomic.netlify.app"
+        "https://rentonomic.netlify.app",
     ],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# Environment variables
-DATABASE_URL = os.getenv("DATABASE_URL")
-CLOUDINARY_URL = os.getenv("CLOUDINARY_URL")
-UPLOAD_FOLDER = os.getenv("UPLOAD_FOLDER", "uploads")
-
-# Configure Cloudinary
-cloudinary.config(cloudinary_url=CLOUDINARY_URL)
-
-# Connect to PostgreSQL
-conn = psycopg2.connect(DATABASE_URL)
-cursor = conn.cursor()
-
-# Create table if it doesn't exist
-cursor.execute("""
-CREATE TABLE IF NOT EXISTS listings (
-    id SERIAL PRIMARY KEY,
-    title TEXT NOT NULL,
-    location TEXT,
-    description TEXT,
-    price_per_day NUMERIC,
-    image_url TEXT
+# Cloudinary setup ✅
+cloudinary.config(
+    cloud_name="dxuik8b3e",
+    api_key="583579498246553",
+    api_secret="tBCf2s1I_iR_c0RXuPQ2QDHwzT8"
 )
-""")
-conn.commit()
 
-# Submit listing
+# Database setup ✅
+DATABASE_URL = "postgresql://postgres:Concrete-0113xyz@monorail.proxy.rlwy.net:49077/railway"
+
 @app.post("/listing")
 async def create_listing(
     title: str = Form(...),
@@ -57,42 +41,30 @@ async def create_listing(
     image: UploadFile = File(...)
 ):
     try:
-        os.makedirs(UPLOAD_FOLDER, exist_ok=True)
-        temp_path = f"{UPLOAD_FOLDER}/{uuid4().hex}_{image.filename}"
-        with open(temp_path, "wb") as f:
-            f.write(await image.read())
-
-        result = cloudinary.uploader.upload(temp_path)
-        os.remove(temp_path)
+        # Upload to Cloudinary ✅
+        public_id = f"rentonomic/{uuid.uuid4()}"
+        result = cloudinary.uploader.upload(image.file, public_id=public_id)
         image_url = result["secure_url"]
 
-        cursor.execute(
-            "INSERT INTO listings (title, location, description, price_per_day, image_url) VALUES (%s, %s, %s, %s, %s)",
-            (title, location, description, price, image_url)
-        )
+        # Insert into PostgreSQL ✅
+        conn = psycopg2.connect(DATABASE_URL)
+        cur = conn.cursor()
+        cur.execute("""
+            INSERT INTO listings (title, location, description, price_per_day, image_url)
+            VALUES (%s, %s, %s, %s, %s)
+        """, (title, location, description, price, image_url))
         conn.commit()
+        cur.close()
+        conn.close()
 
-        return {"message": "Listing created"}
+        return JSONResponse(content={"message": "Listing created successfully"})
 
     except Exception as e:
-        return JSONResponse(status_code=500, content={"error": str(e)})
+        return JSONResponse(content={"error": str(e)}, status_code=500)
 
-# Get all listings
-@app.get("/listings")
-def get_listings():
-    cursor.execute("SELECT * FROM listings ORDER BY id DESC")
-    rows = cursor.fetchall()
-    return [
-        {
-            "id": row[0],
-            "title": row[1],
-            "location": row[2],
-            "description": row[3],
-            "price_per_day": float(row[4]),
-            "image_url": row[5]
-        }
-        for row in rows
-    ]
+@app.get("/")
+def root():
+    return {"status": "Backend is running"}
 
 
 
