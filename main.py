@@ -1,99 +1,97 @@
-from fastapi import FastAPI, File, Form, UploadFile
+from fastapi import FastAPI, UploadFile, Form
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 import psycopg2
 import cloudinary
 import cloudinary.uploader
+import uuid
+import os
 
 app = FastAPI()
 
-# ✅ CORS setup
+# CORS settings
+origins = [
+    "https://rentonomic.com",
+    "https://www.rentonomic.com",
+    "https://rentonomic.netlify.app",
+]
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[
-        "https://rentonomic.com",
-        "https://www.rentonomic.com",
-        "https://rentonomic.netlify.app"
-    ],
+    allow_origins=origins,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# ✅ Cloudinary config
+# Cloudinary configuration (from Render ENV VAR)
 cloudinary.config(
-    cloud_name="dc6v9nqrx",
-    api_key="624284296664252",
-    api_secret="EBgJtD_2Q9Kv2EQJjDaDDEqxmxI"
+    secure=True,
+    cloud_name="dhtcox1qk",  # If this ever changes, update here
+    api_key="544156274679278",
+    api_secret=os.getenv("CLOUDINARY_SECRET")  # Loaded from environment
 )
 
-# ✅ PostgreSQL connection
-conn = psycopg2.connect(
-    host="ep-falling-boat-a58bgdmr.eu-central-1.pg.koyeb.app",
-    database="rentonomic",
-    user="rentonomic_owner",
-    password="Concrete-0113xyz",
-    sslmode="require"
-)
-cur = conn.cursor()
+# Database connection
+DATABASE_URL = os.getenv("DATABASE_URL")
+conn = psycopg2.connect(DATABASE_URL)
+cursor = conn.cursor()
 
-# ✅ Auto-create table if not exists
-cur.execute("""
+# Ensure table exists
+cursor.execute("""
     CREATE TABLE IF NOT EXISTS listings (
         id SERIAL PRIMARY KEY,
         title TEXT,
-        location TEXT,
         description TEXT,
+        location TEXT,
         price_per_day TEXT,
         image_url TEXT
     )
 """)
 conn.commit()
 
-# ✅ Submit listing
-@app.post("/listing")
+@app.post("/listings")
 async def create_listing(
     title: str = Form(...),
-    location: str = Form(...),
     description: str = Form(...),
+    location: str = Form(...),
     price_per_day: str = Form(...),
-    image: UploadFile = File(...)
+    image: UploadFile = Form(...)
 ):
     try:
         # Upload image to Cloudinary
-        result = cloudinary.uploader.upload(image.file)
+        result = cloudinary.uploader.upload(image.file, public_id=str(uuid.uuid4()), folder="rentonomic")
         image_url = result.get("secure_url")
 
         # Insert into DB
-        cur.execute("""
-            INSERT INTO listings (title, location, description, price_per_day, image_url)
-            VALUES (%s, %s, %s, %s, %s)
-        """, (title, location, description, price_per_day, image_url))
+        cursor.execute(
+            "INSERT INTO listings (title, description, location, price_per_day, image_url) VALUES (%s, %s, %s, %s, %s)",
+            (title, description, location, price_per_day, image_url)
+        )
         conn.commit()
 
-        return {"message": "Listing created successfully", "image_url": image_url}
+        return {"message": "Listing created successfully."}
     except Exception as e:
-        return JSONResponse(content={"error": str(e)}, status_code=500)
+        return JSONResponse(status_code=500, content={"error": str(e)})
 
-# ✅ Fetch all listings
 @app.get("/listings")
 def get_listings():
     try:
-        cur.execute("SELECT id, title, location, description, price_per_day, image_url FROM listings ORDER BY id DESC")
-        rows = cur.fetchall()
+        cursor.execute("SELECT * FROM listings ORDER BY id DESC")
+        rows = cursor.fetchall()
         listings = []
         for row in rows:
             listings.append({
                 "id": row[0],
                 "title": row[1],
-                "location": row[2],
-                "description": row[3],
+                "description": row[2],
+                "location": row[3],
                 "price_per_day": row[4],
                 "image_url": row[5]
             })
         return listings
     except Exception as e:
-        return JSONResponse(content={"error": str(e)}, status_code=500)
+        return JSONResponse(status_code=500, content={"error": str(e)})
+
 
 
 
