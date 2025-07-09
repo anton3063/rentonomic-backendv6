@@ -1,106 +1,98 @@
-<!DOCTYPE html>
-<html lang="en">
-<head>
-  <meta charset="UTF-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
-  <title>Rentonomic</title>
-  <link rel="stylesheet" href="style.css" />
-  <style>
-    body {
-      font-family: Arial, sans-serif;
-      background-color: #f9f9f9;
-      margin: 0;
-      padding: 2rem 1rem 3rem;
-      text-align: center;
-    }
+from fastapi import FastAPI, UploadFile, Form, File
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
+import uuid
+import psycopg2
+import os
+import cloudinary.uploader
 
-    img.logo {
-      width: 150px;
-      max-width: 90%;
-      height: auto;
-      margin: 1rem auto;
-    }
+app = FastAPI()
 
-    .buttons {
-      display: flex;
-      justify-content: center;
-      gap: 1rem;
-      margin-bottom: 2rem;
-    }
+# Allow frontend domains
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=[
+        "https://rentonomic.com",
+        "https://www.rentonomic.com",
+        "https://rentonomic.netlify.app"
+    ],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
-    .buttons a {
-      background-color: #28a745;
-      color: white;
-      padding: 0.8rem 2rem;
-      text-decoration: none;
-      border-radius: 6px;
-      font-weight: bold;
-      transition: background 0.3s;
-    }
+# Get environment variables
+DB_URL = os.getenv("DATABASE_URL")
+CLOUD_NAME = os.getenv("CLOUD_NAME")
+CLOUD_API_KEY = os.getenv("CLOUD_API_KEY")
+CLOUD_API_SECRET = os.getenv("CLOUD_API_SECRET")
 
-    .buttons a:hover {
-      background-color: #218838;
-    }
+# Cloudinary config
+cloudinary.config(
+    cloud_name=CLOUD_NAME,
+    api_key=CLOUD_API_KEY,
+    api_secret=CLOUD_API_SECRET
+)
 
-    h2 {
-      margin-top: 3rem;
-      font-size: 1.6rem;
-    }
+@app.post("/listing")
+async def create_listing(
+    title: str = Form(...),
+    location: str = Form(...),
+    description: str = Form(...),
+    price_per_day: int = Form(...),
+    image: UploadFile = File(...)
+):
+    try:
+        # Upload image to Cloudinary
+        result = cloudinary.uploader.upload(image.file)
+        image_url = result.get("secure_url")
 
-    #homeListings {
-      display: flex;
-      overflow-x: auto;
-      gap: 1rem;
-      padding: 1rem;
-      margin-top: 1rem;
-    }
+        # Connect to PostgreSQL
+        conn = psycopg2.connect(DB_URL)
+        cur = conn.cursor()
 
-    .listing-card {
-      background: white;
-      border: 1px solid #ddd;
-      border-radius: 8px;
-      padding: 0.5rem;
-      min-width: 220px;
-      flex: 0 0 auto;
-      cursor: pointer;
-      transition: box-shadow 0.3s;
-    }
+        listing_id = str(uuid.uuid4())
 
-    .listing-card:hover {
-      box-shadow: 0 0 10px rgba(0,0,0,0.1);
-    }
+        cur.execute("""
+            INSERT INTO listings (id, name, location, description, price_per_day, image_url)
+            VALUES (%s, %s, %s, %s, %s, %s)
+        """, (listing_id, title, location, description, price_per_day, image_url))
 
-    .listing-card img {
-      width: 100%;
-      height: 140px;
-      object-fit: cover;
-      border-radius: 6px;
-    }
+        conn.commit()
+        cur.close()
+        conn.close()
 
-    .listing-card h3 {
-      margin: 0.5rem 0 0.2rem;
-    }
+        return {"message": "Listing created successfully"}
 
-    .listing-card p {
-      margin: 0.2rem;
-      font-size: 0.9rem;
-      color: #555;
-    }
-  </style>
-</head>
-<body>
-  <img src="logo.PNG" alt="Rentonomic Logo" class="logo" />
-  <div class="buttons">
-    <a href="list.html">List</a>
-    <a href="rent.html">Rent</a>
-  </div>
+    except Exception as e:
+        return JSONResponse(status_code=500, content={"error": str(e)})
 
-  <h2>Available to Rent</h2>
-  <div id="homeListings">Loading...</div>
+@app.get("/listings")
+def get_listings():
+    try:
+        conn = psycopg2.connect(DB_URL)
+        cur = conn.cursor()
+        cur.execute("SELECT id, name, location, description, price_per_day, image_url FROM listings")
+        rows = cur.fetchall()
+        cur.close()
+        conn.close()
 
-  <script src="script.js"></script>
-</body>
-</html>
+        listings = []
+        for row in rows:
+            listings.append({
+                "id": row[0],
+                "name": row[1],
+                "location": row[2],
+                "description": row[3],
+                "price_per_day": row[4],
+                "image_url": row[5],
+            })
+
+        return listings
+
+    except Exception as e:
+        return JSONResponse(status_code=500, content={"error": str(e)})
+
 
 
 
