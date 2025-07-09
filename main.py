@@ -1,95 +1,107 @@
-from fastapi import FastAPI, UploadFile, File, Form
-from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
-import uuid
-import psycopg2
-import cloudinary
-import cloudinary.uploader
-import os
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+  <title>Rentonomic</title>
+  <link rel="stylesheet" href="style.css" />
+  <style>
+    body {
+      font-family: Arial, sans-serif;
+      background-color: #f9f9f9;
+      margin: 0;
+      padding: 2rem 1rem 3rem;
+      text-align: center;
+    }
 
-app = FastAPI()
+    img.logo {
+      width: 150px;
+      max-width: 90%;
+      height: auto;
+      margin: 1rem auto;
+    }
 
-# CORS
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=[
-        "https://rentonomic.com",
-        "https://www.rentonomic.com",
-        "https://rentonomic.netlify.app"
-    ],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+    .buttons {
+      display: flex;
+      justify-content: center;
+      gap: 1rem;
+      margin-bottom: 2rem;
+    }
 
-# Cloudinary config from individual ENV vars
-cloudinary.config(
-    cloud_name=os.getenv("CLOUD_NAME"),
-    api_key=os.getenv("CLOUD_API_KEY"),
-    api_secret=os.getenv("CLOUD_API_SECRET")
-)
+    .buttons a {
+      background-color: #28a745;
+      color: white;
+      padding: 0.8rem 2rem;
+      text-decoration: none;
+      border-radius: 6px;
+      font-weight: bold;
+      transition: background 0.3s;
+    }
 
-# PostgreSQL config
-DATABASE_URL = os.getenv("DATABASE_URL")
+    .buttons a:hover {
+      background-color: #218838;
+    }
 
-@app.post("/listing")
-async def create_listing(
-    title: str = Form(...),
-    location: str = Form(...),
-    description: str = Form(...),
-    price_per_day: int = Form(...),
-    image: UploadFile = File(...)
-):
-    try:
-        # Upload image to Cloudinary
-        upload_result = cloudinary.uploader.upload(image.file)
-        image_url = upload_result.get("secure_url")
+    h2 {
+      margin-top: 3rem;
+      font-size: 1.6rem;
+    }
 
-        if not image_url:
-            return JSONResponse(status_code=500, content={"error": "Image upload failed"})
+    #homeListings {
+      display: flex;
+      overflow-x: auto;
+      gap: 1rem;
+      padding: 1rem;
+      margin-top: 1rem;
+    }
 
-        # Save to DB
-        conn = psycopg2.connect(DATABASE_URL)
-        cur = conn.cursor()
-        listing_id = str(uuid.uuid4())
-        cur.execute(
-            "INSERT INTO listings (id, name, location, description, price_per_day, image_url) VALUES (%s, %s, %s, %s, %s, %s)",
-            (listing_id, title, location, description, price_per_day, image_url)
-        )
-        conn.commit()
-        cur.close()
-        conn.close()
+    .listing-card {
+      background: white;
+      border: 1px solid #ddd;
+      border-radius: 8px;
+      padding: 0.5rem;
+      min-width: 220px;
+      flex: 0 0 auto;
+      cursor: pointer;
+      transition: box-shadow 0.3s;
+    }
 
-        return {"message": "Listing created successfully!"}
+    .listing-card:hover {
+      box-shadow: 0 0 10px rgba(0,0,0,0.1);
+    }
 
-    except Exception as e:
-        return JSONResponse(status_code=500, content={"error": str(e)})
+    .listing-card img {
+      width: 100%;
+      height: 140px;
+      object-fit: cover;
+      border-radius: 6px;
+    }
 
-@app.get("/listings")
-def get_listings():
-    try:
-        conn = psycopg2.connect(DATABASE_URL)
-        cur = conn.cursor()
-        cur.execute("SELECT id, name, location, description, price_per_day, image_url FROM listings")
-        rows = cur.fetchall()
-        cur.close()
-        conn.close()
+    .listing-card h3 {
+      margin: 0.5rem 0 0.2rem;
+    }
 
-        listings = []
-        for row in rows:
-            listings.append({
-                "id": row[0],
-                "name": row[1],
-                "location": row[2],
-                "description": row[3],
-                "price_per_day": row[4],
-                "image_url": row[5]
-            })
+    .listing-card p {
+      margin: 0.2rem;
+      font-size: 0.9rem;
+      color: #555;
+    }
+  </style>
+</head>
+<body>
+  <img src="logo.PNG" alt="Rentonomic Logo" class="logo" />
+  <div class="buttons">
+    <a href="list.html">List</a>
+    <a href="rent.html">Rent</a>
+  </div>
 
-        return listings
+  <h2>Available to Rent</h2>
+  <div id="homeListings">Loading...</div>
 
-    except Exception as e:
-        return JSONResponse(status_code=500, content={"error": str(e)})
+  <script src="script.js"></script>
+</body>
+</html>
+
 
 
 
