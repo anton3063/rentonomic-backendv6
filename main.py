@@ -1,14 +1,13 @@
-from fastapi import FastAPI, UploadFile, Form, File
+from fastapi import FastAPI, File, UploadFile, Form
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
+from pydantic import BaseModel
 import uuid
 import psycopg2
-import os
-import cloudinary.uploader
+import requests
 
+# CORS settings
 app = FastAPI()
-
-# Allow frontend domains
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[
@@ -21,62 +20,71 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Get environment variables
-DB_URL = os.getenv("DATABASE_URL")
-CLOUD_NAME = os.getenv("CLOUD_NAME")
-CLOUD_API_KEY = os.getenv("CLOUD_API_KEY")
-CLOUD_API_SECRET = os.getenv("CLOUD_API_SECRET")
+# Database connection
+DATABASE_URL = "postgresql://postgresanthony_user:pGgZJxg32gWiUgFshwpFVleNw3RwcLxs@dpg-d1lafv7diees73fefak0-a.oregon-postgres.render.com/postgresanthony"
+conn = psycopg2.connect(DATABASE_URL)
+cursor = conn.cursor()
 
-# Cloudinary config
-cloudinary.config(
-    cloud_name=CLOUD_NAME,
-    api_key=CLOUD_API_KEY,
-    api_secret=CLOUD_API_SECRET
-)
+# Cloudinary credentials
+CLOUD_NAME = "dkzwvm3hh"
+CLOUD_API_KEY = "538411894574491"
+CLOUD_API_SECRET = "BI_MCFrVICVQZWUzJVYTe1GmWfs"
 
-@app.post("/listing")
-async def create_listing(
-    title: str = Form(...),
-    location: str = Form(...),
-    description: str = Form(...),
-    price_per_day: int = Form(...),
-    image: UploadFile = File(...)
-):
+# Listing model
+class Listing(BaseModel):
+    name: str
+    location: str
+    description: str
+    price_per_day: int
+    image_url: str
+    lister_name: str
+    lister_email: str
+
+# Endpoint to submit a new listing
+@app.post("/listings")
+def create_listing(listing: Listing):
     try:
-        # Upload image to Cloudinary
-        result = cloudinary.uploader.upload(image.file)
-        image_url = result.get("secure_url")
+        # Check if lister exists
+        cursor.execute("SELECT id FROM listers WHERE email = %s", (listing.lister_email,))
+        lister = cursor.fetchone()
 
-        # Connect to PostgreSQL
-        conn = psycopg2.connect(DB_URL)
-        cur = conn.cursor()
+        if lister:
+            lister_id = lister[0]
+        else:
+            lister_id = str(uuid.uuid4())
+            cursor.execute(
+                "INSERT INTO listers (id, name, email) VALUES (%s, %s, %s)",
+                (lister_id, listing.lister_name, listing.lister_email)
+            )
 
+        # Create new listing
         listing_id = str(uuid.uuid4())
-
-        cur.execute("""
-            INSERT INTO listings (id, name, location, description, price_per_day, image_url)
-            VALUES (%s, %s, %s, %s, %s, %s)
-        """, (listing_id, title, location, description, price_per_day, image_url))
+        cursor.execute("""
+            INSERT INTO listings (id, name, location, description, price_per_day, image_url, lister_id)
+            VALUES (%s, %s, %s, %s, %s, %s, %s)
+        """, (
+            listing_id,
+            listing.name,
+            listing.location,
+            listing.description,
+            listing.price_per_day,
+            listing.image_url,
+            lister_id
+        ))
 
         conn.commit()
-        cur.close()
-        conn.close()
-
         return {"message": "Listing created successfully"}
 
     except Exception as e:
-        return JSONResponse(status_code=500, content={"error": str(e)})
+        conn.rollback()
+        return JSONResponse(content={"error": str(e)}, status_code=500)
 
+# Endpoint to fetch all listings
 @app.get("/listings")
 def get_listings():
     try:
-        conn = psycopg2.connect(DB_URL)
-        cur = conn.cursor()
-        cur.execute("SELECT id, name, location, description, price_per_day, image_url FROM listings")
-        rows = cur.fetchall()
-        cur.close()
-        conn.close()
-
+        cursor.execute("SELECT id, name, location, description, price_per_day, image_url FROM listings")
+        rows = cursor.fetchall()
         listings = []
         for row in rows:
             listings.append({
@@ -85,13 +93,12 @@ def get_listings():
                 "location": row[2],
                 "description": row[3],
                 "price_per_day": row[4],
-                "image_url": row[5],
+                "image_url": row[5]
             })
-
         return listings
-
     except Exception as e:
-        return JSONResponse(status_code=500, content={"error": str(e)})
+        return JSONResponse(content={"error": str(e)}, status_code=500)
+
 
 
 
