@@ -2,8 +2,8 @@ from fastapi import FastAPI, UploadFile, Form
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 import uuid
-import psycopg2
-import cloudinary
+import  psycopg2
+importcloudinary
 import cloudinary.uploader
 
 app = FastAPI()
@@ -28,7 +28,7 @@ cloudinary.config(
 conn = psycopg2.connect("postgresql://postgresanthony_user:pGgZJxg32gWiUgFshwpFVleNw3RwcLxs@dpg-d1lafv7diees73fefak0-a.oregon-postgres.render.com/postgresanthony")
 cursor = conn.cursor()
 
-# Create table if not exists with email field
+# Create table if not exists
 cursor.execute('''
 CREATE TABLE IF NOT EXISTS listings (
     id UUID PRIMARY KEY,
@@ -54,7 +54,6 @@ async def create_listing(
     try:
         result = cloudinary.uploader.upload(image.file)
         image_url = result.get("secure_url")
-
         listing_id = uuid.uuid4()
 
         cursor.execute(
@@ -86,6 +85,7 @@ def get_listings():
         return listings
     except Exception as e:
         return JSONResponse(status_code=500, content={"error": str(e)})
+
 
 
 
