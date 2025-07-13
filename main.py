@@ -2,8 +2,8 @@ from fastapi import FastAPI, UploadFile, Form
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 import uuid
-import  psycopg2
-importcloudinary
+import psycopg2
+import cloudinary
 import cloudinary.uploader
 
 app = FastAPI()
@@ -85,6 +85,7 @@ def get_listings():
         return listings
     except Exception as e:
         return JSONResponse(status_code=500, content={"error": str(e)})
+
 
 
 
