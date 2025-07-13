@@ -1,13 +1,13 @@
 from fastapi import FastAPI, File, UploadFile, Form
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel
 import uuid
 import psycopg2
-import requests
+import cloudinary.uploader
+
+app = FastAPI()
 
 # CORS settings
-app = FastAPI()
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[
@@ -20,84 +20,57 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Database connection
-DATABASE_URL = "postgresql://postgresanthony_user:pGgZJxg32gWiUgFshwpFVleNw3RwcLxs@dpg-d1lafv7diees73fefak0-a.oregon-postgres.render.com/postgresanthony"
-conn = psycopg2.connect(DATABASE_URL)
+# Cloudinary config
+cloudinary.config(
+    cloud_name="dkzwvm3hh",
+    api_key="538411894574491",
+    api_secret="BI_MCFrVICVQZWUzJVYTe1GmWfs"
+)
+
+# PostgreSQL config
+db_url = "postgresql://postgresanthony_user:pGgZJxg32gWiUgFshwpFVleNw3RwcLxs@dpg-d1lafv7diees73fefak0-a.oregon-postgres.render.com/postgresanthony"
+conn = psycopg2.connect(db_url)
 cursor = conn.cursor()
 
-# Cloudinary credentials
-CLOUD_NAME = "dkzwvm3hh"
-CLOUD_API_KEY = "538411894574491"
-CLOUD_API_SECRET = "BI_MCFrVICVQZWUzJVYTe1GmWfs"
-
-# Listing model
-class Listing(BaseModel):
-    name: str
-    location: str
-    description: str
-    price_per_day: int
-    image_url: str
-    lister_name: str
-    lister_email: str
-
-# Endpoint to submit a new listing
-@app.post("/listings")
-def create_listing(listing: Listing):
+@app.post("/list")
+async def list_item(
+    name: str = Form(...),
+    location: str = Form(...),
+    description: str = Form(...),
+    price_per_day: int = Form(...),
+    image: UploadFile = File(...)
+):
     try:
-        # Check if lister exists
-        cursor.execute("SELECT id FROM listers WHERE email = %s", (listing.lister_email,))
-        lister = cursor.fetchone()
+        upload_result = cloudinary.uploader.upload(image.file)
+        image_url = upload_result["secure_url"]
+        item_id = str(uuid.uuid4())
 
-        if lister:
-            lister_id = lister[0]
-        else:
-            lister_id = str(uuid.uuid4())
-            cursor.execute(
-                "INSERT INTO listers (id, name, email) VALUES (%s, %s, %s)",
-                (lister_id, listing.lister_name, listing.lister_email)
-            )
-
-        # Create new listing
-        listing_id = str(uuid.uuid4())
         cursor.execute("""
-            INSERT INTO listings (id, name, location, description, price_per_day, image_url, lister_id)
-            VALUES (%s, %s, %s, %s, %s, %s, %s)
-        """, (
-            listing_id,
-            listing.name,
-            listing.location,
-            listing.description,
-            listing.price_per_day,
-            listing.image_url,
-            lister_id
-        ))
-
+            INSERT INTO listings (id, name, location, description, price_per_day, image_url)
+            VALUES (%s, %s, %s, %s, %s, %s)
+        """, (item_id, name, location, description, price_per_day, image_url))
         conn.commit()
-        return {"message": "Listing created successfully"}
 
+        return {"status": "success", "image_url": image_url}
     except Exception as e:
-        conn.rollback()
-        return JSONResponse(content={"error": str(e)}, status_code=500)
+        return JSONResponse(status_code=500, content={"status": "error", "message": str(e)})
 
-# Endpoint to fetch all listings
 @app.get("/listings")
 def get_listings():
-    try:
-        cursor.execute("SELECT id, name, location, description, price_per_day, image_url FROM listings")
-        rows = cursor.fetchall()
-        listings = []
-        for row in rows:
-            listings.append({
-                "id": row[0],
-                "name": row[1],
-                "location": row[2],
-                "description": row[3],
-                "price_per_day": row[4],
-                "image_url": row[5]
-            })
-        return listings
-    except Exception as e:
-        return JSONResponse(content={"error": str(e)}, status_code=500)
+    cursor.execute("SELECT id, name, location, description, price_per_day, image_url FROM listings ORDER BY id DESC")
+    rows = cursor.fetchall()
+    listings = []
+    for row in rows:
+        listings.append({
+            "id": row[0],
+            "name": row[1],
+            "location": row[2],
+            "description": row[3],
+            "price_per_day": row[4],
+            "image_url": row[5]
+        })
+    return listings
+
 
 
 
