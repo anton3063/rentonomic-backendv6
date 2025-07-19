@@ -37,7 +37,7 @@ CREATE TABLE IF NOT EXISTS listings (
     description TEXT,
     price_per_day INTEGER,
     image_url TEXT,
-    email TEXT
+    email TEXT  -- Still in table for now, will be removed once user auth is added
 )
 ''')
 conn.commit()
@@ -48,7 +48,6 @@ async def create_listing(
     location: str = Form(...),
     description: str = Form(...),
     price_per_day: int = Form(...),
-    email: str = Form(...),
     image: UploadFile = Form(...)
 ):
     try:
@@ -56,9 +55,12 @@ async def create_listing(
         image_url = result.get("secure_url")
         listing_id = uuid.uuid4()
 
+        # Placeholder email for now — will be replaced with logged-in user identity later
+        placeholder_email = "placeholder@rentonomic.com"
+
         cursor.execute(
             "INSERT INTO listings (id, name, location, description, price_per_day, image_url, email) VALUES (%s, %s, %s, %s, %s, %s, %s)",
-            (listing_id, name, location, description, price_per_day, image_url, email)
+            (listing_id, name, location, description, price_per_day, image_url, placeholder_email)
         )
         conn.commit()
 
@@ -85,6 +87,7 @@ def get_listings():
         return listings
     except Exception as e:
         return JSONResponse(status_code=500, content={"error": str(e)})
+
 
 
 
