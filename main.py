@@ -7,7 +7,6 @@ import httpx
 import os
 from typing import Optional
 from fastapi import status
-from fastapi.staticfiles import StaticFiles
 
 app = FastAPI()
 
@@ -26,15 +25,10 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Connect to the PostgreSQL database using environment variable
+# Connect to PostgreSQL using environment variable
 DATABASE_URL = os.getenv("DATABASE_URL")
-
 conn = psycopg2.connect(DATABASE_URL)
 cursor = conn.cursor()
-
-# Serve static files if needed later
-app.mount("/static", StaticFiles(directory="static"), name="static")
-
 
 @app.post("/list")
 async def list_item(
@@ -51,7 +45,6 @@ async def list_item(
         (listing_id, name, location, description, price_per_day, image_url)
     )
     conn.commit()
-
     return {"message": "Item listed successfully!"}
 
 
@@ -117,8 +110,6 @@ Thanks for using Rentonomic!
             "content": [{"type": "text/plain", "value": email_content}]
         }
     )
-
-
 
 
 
