@@ -1,4 +1,4 @@
-from fastapi import FastAPI, UploadFile, Form
+from fastapi import FastAPI, UploadFile, Form, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 import uuid
@@ -11,7 +11,7 @@ app = FastAPI()
 # CORS settings
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=["*"],  # Consider limiting in production
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -28,7 +28,7 @@ cloudinary.config(
 conn = psycopg2.connect("postgresql://postgresanthony_user:pGgZJxg32gWiUgFshwpFVleNw3RwcLxs@dpg-d1lafv7diees73fefak0-a.oregon-postgres.render.com/postgresanthony")
 cursor = conn.cursor()
 
-# Create table if not exists
+# Create listings table if not exists
 cursor.execute('''
 CREATE TABLE IF NOT EXISTS listings (
     id UUID PRIMARY KEY,
@@ -38,6 +38,16 @@ CREATE TABLE IF NOT EXISTS listings (
     price_per_day INTEGER,
     image_url TEXT,
     email TEXT
+)
+''')
+
+# Create rental_requests table if not exists
+cursor.execute('''
+CREATE TABLE IF NOT EXISTS rental_requests (
+    id UUID PRIMARY KEY,
+    item_id UUID,
+    date TEXT,
+    message TEXT
 )
 ''')
 conn.commit()
@@ -75,7 +85,7 @@ def get_listings():
             {
                 "id": str(row[0]),
                 "name": row[1],
-                "location": row[2].split()[0],  # Show only first part of postcode
+                "location": row[2].split()[0],
                 "description": row[3],
                 "price_per_day": row[4],
                 "image_url": row[5]
@@ -85,6 +95,26 @@ def get_listings():
         return listings
     except Exception as e:
         return JSONResponse(status_code=500, content={"error": str(e)})
+
+@app.post("/rental-request")
+async def rental_request(request: Request):
+    try:
+        data = await request.json()
+        item_id = data.get("item_id")
+        date = data.get("date")
+        message = data.get("message")
+        request_id = uuid.uuid4()
+
+        cursor.execute(
+            "INSERT INTO rental_requests (id, item_id, date, message) VALUES (%s, %s, %s, %s)",
+            (request_id, item_id, date, message)
+        )
+        conn.commit()
+
+        return {"message": "Rental request submitted successfully"}
+    except Exception as e:
+        return JSONResponse(status_code=500, content={"error": str(e)})
+
 
 
 
