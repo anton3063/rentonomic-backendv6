@@ -1,8 +1,10 @@
 fastapi
 uvicorn
 psycopg2-binary
-httpx
+bcrypt
+python-jose
 python-multipart
+
 
 
 
