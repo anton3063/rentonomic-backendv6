@@ -4,6 +4,8 @@ psycopg2-binary
 bcrypt
 PyJWT
 python-multipart
+python-dotenv
+
 
 
 
