@@ -11,10 +11,10 @@ from datetime import datetime, timedelta
 
 app = FastAPI()
 
-# CORS (adjust for frontend domain)
+# CORS
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # You can restrict this
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -67,32 +67,42 @@ def create_token(email: str):
 
 @app.post("/signup")
 def signup(data: SignupData):
-    cursor.execute("SELECT * FROM users WHERE email = %s", (data.email,))
-    if cursor.fetchone():
-        raise HTTPException(status_code=400, detail="Email already registered")
-    
-    hashed = bcrypt.hashpw(data.password.encode(), bcrypt.gensalt())
-    cursor.execute("INSERT INTO users (id, email, password_hash) VALUES (%s, %s, %s)", (
-        str(uuid.uuid4()), data.email, hashed.decode()))
-    conn.commit()
+    try:
+        cursor.execute("SELECT * FROM users WHERE email = %s", (data.email,))
+        if cursor.fetchone():
+            raise HTTPException(status_code=400, detail="Email already registered")
 
-    # 🔐 Return token like login does
-    token = create_token(data.email)
-    return {"token": token}
+        hashed = bcrypt.hashpw(data.password.encode(), bcrypt.gensalt())
+        cursor.execute("INSERT INTO users (id, email, password_hash) VALUES (%s, %s, %s)", (
+            str(uuid.uuid4()), data.email, hashed.decode()))
+        conn.commit()
+
+        token = create_token(data.email)
+        return {"token": token}
+
+    except Exception as e:
+        conn.rollback()
+        raise HTTPException(status_code=500, detail=str(e))
 
 @app.post("/login")
 def login(data: LoginData):
-    cursor.execute("SELECT password_hash FROM users WHERE email = %s", (data.email,))
-    user = cursor.fetchone()
-    if not user or not bcrypt.checkpw(data.password.encode(), user[0].encode()):
-        raise HTTPException(status_code=401, detail="Invalid credentials")
+    try:
+        cursor.execute("SELECT password_hash FROM users WHERE email = %s", (data.email,))
+        user = cursor.fetchone()
+        if not user or not bcrypt.checkpw(data.password.encode(), user[0].encode()):
+            raise HTTPException(status_code=401, detail="Invalid credentials")
 
-    token = create_token(data.email)
-    return {"token": token}
+        token = create_token(data.email)
+        return {"token": token}
+
+    except Exception as e:
+        conn.rollback()
+        raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/me")
 def get_me(request: Request, token: str = Depends(JWTBearer())):
     return {"email": request.state.user["sub"]}
+
 
 
 
