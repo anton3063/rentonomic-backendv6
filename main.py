@@ -25,7 +25,7 @@ DATABASE_URL = os.environ.get("DATABASE_URL")
 conn = psycopg2.connect(DATABASE_URL)
 cursor = conn.cursor()
 
-# JWT secret
+# JWT config
 JWT_SECRET = os.environ.get("JWT_SECRET", "secret123")
 JWT_ALGORITHM = "HS256"
 JWT_EXPIRATION_MINUTES = 60
@@ -75,7 +75,10 @@ def signup(data: SignupData):
     cursor.execute("INSERT INTO users (id, email, password_hash) VALUES (%s, %s, %s)", (
         str(uuid.uuid4()), data.email, hashed.decode()))
     conn.commit()
-    return {"message": "Signup successful"}
+
+    # 🔐 Return token like login does
+    token = create_token(data.email)
+    return {"token": token}
 
 @app.post("/login")
 def login(data: LoginData):
@@ -90,6 +93,7 @@ def login(data: LoginData):
 @app.get("/me")
 def get_me(request: Request, token: str = Depends(JWTBearer())):
     return {"email": request.state.user["sub"]}
+
 
 
 
