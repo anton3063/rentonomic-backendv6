@@ -1,12 +1,13 @@
 fastapi
 uvicorn
+python-multipart
 psycopg2-binary
 bcrypt
-PyJWT
-python-multipart
-python-dotenv
+python-jose
 requests
+cloudinary
 sendgrid
+python-dotenv
 
 
 
