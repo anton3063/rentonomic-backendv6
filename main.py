@@ -1,4 +1,4 @@
-from fastapi import FastAPI, HTTPException, Request, Depends, Form, UploadFile
+from fastapi import FastAPI, HTTPException, Request, Depends
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from pydantic import BaseModel
@@ -21,7 +21,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# DB connection
+# DB
 DATABASE_URL = os.environ.get("DATABASE_URL")
 conn = psycopg2.connect(DATABASE_URL)
 cursor = conn.cursor()
@@ -74,9 +74,8 @@ def signup(data: SignupData):
             raise HTTPException(status_code=400, detail="Email already registered")
 
         hashed = bcrypt.hashpw(data.password.encode(), bcrypt.gensalt())
-        cursor.execute(
-            "INSERT INTO users (id, email, password_hash, created_at, is_verified) VALUES (%s, %s, %s, NOW(), FALSE)",
-            (str(uuid.uuid4()), data.email, hashed.decode()))
+        cursor.execute("INSERT INTO users (id, email, password_hash, created_at, is_verified) VALUES (%s, %s, %s, NOW(), FALSE)",
+                       (str(uuid.uuid4()), data.email, hashed.decode()))
         conn.commit()
         return {"token": create_token(data.email)}
     except Exception as e:
@@ -98,52 +97,27 @@ def login(data: LoginData):
 def get_me(request: Request, token: str = Depends(JWTBearer())):
     return {"email": request.state.user["sub"]}
 
-# === LIST ITEM ===
-@app.post("/list")
-def list_item(
-    name: str = Form(...),
-    location: str = Form(...),
-    description: str = Form(...),
-    price: int = Form(...),
-    image: UploadFile = Form(...),
-    email: str = Form(...)
-):
-    try:
-        image_bytes = image.file.read()
-        cloudinary_url = "https://api.cloudinary.com/v1_1/dkzwvm3hh/image/upload"
-        payload = {
-            'file': f'data:{image.content_type};base64,{image_bytes.decode("latin1")}',
-            'upload_preset': 'rentonomic_unsigned'
-        }
-        response = requests.post(cloudinary_url, files={"file": image_bytes}, data={"upload_preset": "rentonomic_unsigned"})
-        image_url = response.json()["secure_url"]
-
-        cursor.execute("INSERT INTO listings (id, name, location, description, price_per_day, image_url, email) VALUES (%s, %s, %s, %s, %s, %s, %s)",
-            (str(uuid.uuid4()), name, location, description, price, image_url, email))
-        conn.commit()
-        return {"message": "Item listed successfully"}
-    except Exception as e:
-        conn.rollback()
-        raise HTTPException(status_code=500, detail=str(e))
-
-@app.get("/listings")
-def get_listings():
-    try:
-        cursor.execute("SELECT name, location, price_per_day, image_url FROM listings ORDER BY name ASC")
-        listings = cursor.fetchall()
-        return [{
-            "name": r[0],
-            "location": r[1],
-            "price": r[2],
-            "image_url": r[3]
-        } for r in listings]
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-# === RENTAL REQUEST ===
+# === RENTAL REQUEST (SAVES + EMAILS) ===
 @app.post("/request-to-rent")
-def request_to_rent(data: RentRequest):
+def request_to_rent(data: RentRequest, request: Request = None, token: str = Depends(JWTBearer())):
+    renter_email = request.state.user["sub"]
+
     try:
+        # Save to DB
+        cursor.execute("""
+            INSERT INTO rental_requests (id, item_name, lister_email, renter_email, selected_dates, status)
+            VALUES (%s, %s, %s, %s, %s, %s)
+        """, (
+            str(uuid.uuid4()),
+            data.item_name,
+            data.lister_email,
+            renter_email,
+            data.selected_dates,
+            "Pending"
+        ))
+        conn.commit()
+
+        # Send email via SendGrid
         message = f"""
         You have a rental request for your item: {data.item_name}
         Dates requested: {', '.join(data.selected_dates)}
@@ -167,8 +141,10 @@ def request_to_rent(data: RentRequest):
         if response.status_code >= 400:
             raise HTTPException(status_code=500, detail="SendGrid error")
 
-        return {"message": "Rental request sent"}
+        return {"message": "Rental request sent and saved"}
+
     except Exception as e:
+        conn.rollback()
         raise HTTPException(status_code=500, detail=str(e))
 
 # === ADMIN: GET USERS ===
@@ -201,6 +177,26 @@ def get_all_listings(request: Request):
         "price": r[2],
         "email": r[3]
     } for r in rows]
+
+# === ADMIN: GET ALL RENTALS ===
+@app.get("/admin/rentals", dependencies=[Depends(JWTBearer())])
+def get_rentals(request: Request):
+    email = request.state.user["sub"]
+    if email != "admin@rentonomic.com":
+        raise HTTPException(status_code=403, detail="Access denied")
+
+    try:
+        cursor.execute("SELECT item_name, renter_email, selected_dates, status FROM rental_requests ORDER BY requested_at DESC")
+        rows = cursor.fetchall()
+        return [{
+            "item": r[0],
+            "renter": r[1],
+            "dates": r[2],
+            "status": r[3]
+        } for r in rows]
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
 
 
 
