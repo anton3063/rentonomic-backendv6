@@ -103,6 +103,28 @@ def login(data: LoginData):
 def get_me(request: Request, token: str = Depends(JWTBearer())):
     return {"email": request.state.user["sub"]}
 
+# === Admin Endpoint: Get All Users ===
+
+@app.get("/users", dependencies=[Depends(JWTBearer())])
+def get_all_users(request: Request):
+    user_email = request.state.user["sub"]
+    if user_email != "admin@rentonomic.com":
+        raise HTTPException(status_code=403, detail="Access denied")
+
+    try:
+        cursor.execute("SELECT email, created_at, is_verified FROM users ORDER BY created_at DESC")
+        rows = cursor.fetchall()
+        result = []
+        for row in rows:
+            result.append({
+                "email": row[0],
+                "signup_date": row[1].strftime("%Y-%m-%d") if row[1] else "N/A",
+                "is_verified": row[2]
+            })
+        return result
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
 
 
 
