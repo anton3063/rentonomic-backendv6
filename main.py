@@ -155,6 +155,22 @@ def request_to_rent(data: RentalRequest):
             raise HTTPException(status_code=404, detail="Listing not found")
         owner_email, item_name = result
 
+        # Insert into rental_requests table
+        cur.execute("""
+            INSERT INTO rental_requests (id, listing_id, renter_email, lister_email, rental_dates, message, request_time)
+            VALUES (%s, %s, %s, %s, %s, %s, %s)
+        """, (
+            str(uuid.uuid4()),
+            data.listing_id,
+            data.renter_email,
+            owner_email,
+            ", ".join(data.dates),
+            "Is your item available for rent on this/these days?",
+            datetime.utcnow()
+        ))
+        conn.commit()
+
+        # Send email via SendGrid
         subject = f"Rental Request for '{item_name}'"
         body = f"""
         Hi there,
@@ -184,6 +200,8 @@ def request_to_rent(data: RentalRequest):
         if res.status_code not in [200, 202]:
             raise HTTPException(status_code=500, detail="Failed to send email")
 
+        cur.close()
+        conn.close()
         return {"message": "Request sent"}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
@@ -247,6 +265,35 @@ def delete_listing(listing_id: str, admin: str = Depends(verify_admin)):
     cur.close()
     conn.close()
     return {"message": "Listing deleted"}
+
+# ADMIN: Rental Requests (NEW!)
+@app.get("/rental-requests")
+def get_rental_requests(admin: str = Depends(verify_admin)):
+    conn = get_db_connection()
+    cur = conn.cursor()
+    cur.execute("""
+        SELECT rr.id, rr.listing_id, l.name, rr.renter_email, rr.lister_email, rr.rental_dates, rr.message, rr.request_time
+        FROM rental_requests rr
+        JOIN listings l ON rr.listing_id = l.id
+        ORDER BY rr.request_time DESC
+    """)
+    rows = cur.fetchall()
+    cur.close()
+    conn.close()
+    return [
+        {
+            "id": row[0],
+            "listing_id": row[1],
+            "listing_name": row[2],
+            "renter_email": row[3],
+            "lister_email": row[4],
+            "rental_dates": row[5],
+            "message": row[6],
+            "request_time": row[7].isoformat()
+        }
+        for row in rows
+    ]
+
 
 
 
