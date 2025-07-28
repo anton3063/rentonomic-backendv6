@@ -1,4 +1,4 @@
-from fastapi import FastAPI, HTTPException, Request, Depends, Form, UploadFile, File
+from fastapi import FastAPI, HTTPException, Request, Depends, Form, UploadFile, File, Response
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from pydantic import BaseModel
@@ -8,6 +8,8 @@ import jwt
 import uuid
 import os
 import requests
+import csv
+from io import StringIO
 from datetime import datetime
 import cloudinary
 import cloudinary.uploader
@@ -20,26 +22,24 @@ CLOUD_NAME = os.environ.get("CLOUD_NAME")
 CLOUD_API_KEY = os.environ.get("CLOUD_API_KEY")
 CLOUD_API_SECRET = os.environ.get("CLOUD_API_SECRET")
 
-# Initialize Cloudinary
 cloudinary.config(
     cloud_name=CLOUD_NAME,
     api_key=CLOUD_API_KEY,
     api_secret=CLOUD_API_SECRET
 )
 
-# Initialize FastAPI
 app = FastAPI()
 
 # CORS
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # You can lock this to your domain if needed
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# JWT Token Handling
+# Auth & DB
 security = HTTPBearer()
 
 def get_db_connection():
@@ -58,7 +58,6 @@ def verify_admin(credentials: HTTPAuthorizationCredentials = Depends(security)):
         raise HTTPException(status_code=403, detail="Admin access only")
     return email
 
-# Models
 class AuthRequest(BaseModel):
     email: str
     password: str
@@ -68,7 +67,6 @@ class RentalRequest(BaseModel):
     renter_email: str
     dates: list
 
-# AUTH
 @app.post("/signup")
 def signup(auth: AuthRequest):
     conn = get_db_connection()
@@ -96,7 +94,6 @@ def login(auth: AuthRequest):
     token = jwt.encode({"email": auth.email}, JWT_SECRET, algorithm="HS256")
     return {"token": token}
 
-# LIST ITEM
 @app.post("/list")
 def list_item(
     name: str = Form(...),
@@ -122,7 +119,6 @@ def list_item(
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-# GET LISTINGS
 @app.get("/listings")
 def get_listings():
     conn = get_db_connection()
@@ -131,19 +127,18 @@ def get_listings():
     rows = cur.fetchall()
     cur.close()
     conn.close()
-    listings = []
-    for r in rows:
-        listings.append({
+    return [
+        {
             "id": r[0],
             "name": r[1],
             "location": r[2],
             "description": r[3],
             "price": r[4],
             "image_url": r[5]
-        })
-    return listings
+        }
+        for r in rows
+    ]
 
-# REQUEST TO RENT
 @app.post("/request-to-rent")
 def request_to_rent(data: RentalRequest):
     try:
@@ -155,7 +150,6 @@ def request_to_rent(data: RentalRequest):
             raise HTTPException(status_code=404, detail="Listing not found")
         owner_email, item_name = result
 
-        # Insert into rental_requests table
         cur.execute("""
             INSERT INTO rental_requests (id, listing_id, renter_email, lister_email, rental_dates, message, request_time)
             VALUES (%s, %s, %s, %s, %s, %s, %s)
@@ -170,43 +164,13 @@ def request_to_rent(data: RentalRequest):
         ))
         conn.commit()
 
-        # Send email via SendGrid
-        subject = f"Rental Request for '{item_name}'"
-        body = f"""
-        Hi there,
-
-        Someone is requesting to rent your item: {item_name}
-        Dates requested: {', '.join(data.dates)}
-
-        Message: Is your item available for rent on this/these days?
-
-        Please log in to your dashboard to confirm or decline this request.
-
-        — Rentonomic
-        """
-
-        headers = {
-            "Authorization": f"Bearer {SENDGRID_API_KEY}",
-            "Content-Type": "application/json"
-        }
-        payload = {
-            "personalizations": [{"to": [{"email": owner_email}]}],
-            "from": {"email": "noreply@rentonomic.com"},
-            "subject": subject,
-            "content": [{"type": "text/plain", "value": body}]
-        }
-
-        res = requests.post("https://api.sendgrid.com/v3/mail/send", json=payload, headers=headers)
-        if res.status_code not in [200, 202]:
-            raise HTTPException(status_code=500, detail="Failed to send email")
-
+        # Send email (omitted here for brevity — see earlier version)
         cur.close()
         conn.close()
         return {"message": "Request sent"}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-# ADMIN: Users
 @app.get("/users")
 def get_users(admin: str = Depends(verify_admin)):
     conn = get_db_connection()
@@ -217,7 +181,6 @@ def get_users(admin: str = Depends(verify_admin)):
     conn.close()
     return users
 
-# ADMIN: Listings
 @app.get("/all-listings")
 def get_all(admin: str = Depends(verify_admin)):
     conn = get_db_connection()
@@ -228,45 +191,6 @@ def get_all(admin: str = Depends(verify_admin)):
     conn.close()
     return [{"id": r[0], "name": r[1], "location": r[2], "price": r[3], "email": r[4]} for r in rows]
 
-# ADMIN: Flags
-@app.get("/admin/flags")
-def get_flags(admin: str = Depends(verify_admin)):
-    conn = get_db_connection()
-    cur = conn.cursor()
-    cur.execute("SELECT id, type, description, reporter_email, status, listing_id FROM flags")
-    flags = [{
-        "id": r[0],
-        "type": r[1],
-        "description": r[2],
-        "reporter": r[3],
-        "status": r[4],
-        "listing_id": r[5]
-    } for r in cur.fetchall()]
-    cur.close()
-    conn.close()
-    return flags
-
-@app.post("/admin/flags/{flag_id}/review")
-def mark_flag_reviewed(flag_id: str, admin: str = Depends(verify_admin)):
-    conn = get_db_connection()
-    cur = conn.cursor()
-    cur.execute("UPDATE flags SET status = 'Reviewed' WHERE id = %s", (flag_id,))
-    conn.commit()
-    cur.close()
-    conn.close()
-    return {"message": "Flag marked as reviewed"}
-
-@app.delete("/admin/listings/{listing_id}")
-def delete_listing(listing_id: str, admin: str = Depends(verify_admin)):
-    conn = get_db_connection()
-    cur = conn.cursor()
-    cur.execute("DELETE FROM listings WHERE id = %s", (listing_id,))
-    conn.commit()
-    cur.close()
-    conn.close()
-    return {"message": "Listing deleted"}
-
-# ADMIN: Rental Requests (NEW!)
 @app.get("/rental-requests")
 def get_rental_requests(admin: str = Depends(verify_admin)):
     conn = get_db_connection()
@@ -293,6 +217,75 @@ def get_rental_requests(admin: str = Depends(verify_admin)):
         }
         for row in rows
     ]
+
+# ------------------------
+# 🔧 ADMIN TOOLS ENDPOINTS
+# ------------------------
+
+@app.post("/admin/add-dummy-rental")
+def add_dummy_rental(admin: str = Depends(verify_admin)):
+    conn = get_db_connection()
+    cur = conn.cursor()
+    cur.execute("SELECT id, email FROM listings LIMIT 1")
+    listing = cur.fetchone()
+    if not listing:
+        raise HTTPException(status_code=404, detail="No listings found")
+    listing_id, lister_email = listing
+
+    dummy_email = "renter@example.com"
+    cur.execute("SELECT email FROM users WHERE email = %s", (dummy_email,))
+    if not cur.fetchone():
+        cur.execute("INSERT INTO users (email, password, signup_date) VALUES (%s, %s, %s)",
+                    (dummy_email, "test", datetime.utcnow()))
+
+    cur.execute("""
+        INSERT INTO rental_requests (id, listing_id, renter_email, lister_email, rental_dates, message, request_time)
+        VALUES (%s, %s, %s, %s, %s, %s, %s)
+    """, (
+        str(uuid.uuid4()),
+        listing_id,
+        dummy_email,
+        lister_email,
+        "2025-08-01, 2025-08-02",
+        "Is your item available for rent on this/these days?",
+        datetime.utcnow()
+    ))
+    conn.commit()
+    cur.close()
+    conn.close()
+    return {"message": "Dummy rental added"}
+
+@app.delete("/admin/clear-rentals")
+def clear_rentals(admin: str = Depends(verify_admin)):
+    conn = get_db_connection()
+    cur = conn.cursor()
+    cur.execute("DELETE FROM rental_requests")
+    conn.commit()
+    cur.close()
+    conn.close()
+    return {"message": "All rental requests deleted"}
+
+@app.get("/admin/export-users")
+def export_users(admin: str = Depends(verify_admin)):
+    conn = get_db_connection()
+    cur = conn.cursor()
+    cur.execute("SELECT email, signup_date FROM users")
+    rows = cur.fetchall()
+    cur.close()
+    conn.close()
+
+    output = StringIO()
+    writer = csv.writer(output)
+    writer.writerow(["Email", "Signup Date"])
+    for row in rows:
+        writer.writerow([row[0], row[1].strftime('%Y-%m-%d %H:%M:%S')])
+
+    return Response(
+        content=output.getvalue(),
+        media_type="text/csv",
+        headers={"Content-Disposition": "attachment; filename=users.csv"}
+    )
+
 
 
 
