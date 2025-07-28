@@ -100,12 +100,22 @@ def list_item(
     location: str = Form(...),
     description: str = Form(...),
     price: int = Form(...),
-    email: str = Form(...),
-    image: UploadFile = File(...)
+    image: UploadFile = File(...),
+    credentials: HTTPAuthorizationCredentials = Depends(security)
 ):
     try:
+        # Get user email from JWT token
+        token = credentials.credentials
+        payload = jwt.decode(token, JWT_SECRET, algorithms=["HS256"])
+        email = payload.get("email")
+        if not email:
+            raise HTTPException(status_code=401, detail="Unauthorized")
+
+        # Upload image to Cloudinary
         upload_result = cloudinary.uploader.upload(image.file)
         image_url = upload_result.get("secure_url")
+
+        # Save to database
         conn = get_db_connection()
         cur = conn.cursor()
         cur.execute("""
@@ -163,8 +173,6 @@ def request_to_rent(data: RentalRequest):
             datetime.utcnow()
         ))
         conn.commit()
-
-        # Send email (omitted here for brevity — see earlier version)
         cur.close()
         conn.close()
         return {"message": "Request sent"}
@@ -217,10 +225,6 @@ def get_rental_requests(admin: str = Depends(verify_admin)):
         }
         for row in rows
     ]
-
-# ------------------------
-# 🔧 ADMIN TOOLS ENDPOINTS
-# ------------------------
 
 @app.post("/admin/add-dummy-rental")
 def add_dummy_rental(admin: str = Depends(verify_admin)):
@@ -285,6 +289,7 @@ def export_users(admin: str = Depends(verify_admin)):
         media_type="text/csv",
         headers={"Content-Disposition": "attachment; filename=users.csv"}
     )
+
 
 
 
