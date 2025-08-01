@@ -171,28 +171,8 @@ def request_to_rent(data: RentalRequest):
     conn.close()
     return {"message": "Request sent"}
 
-@app.get("/users")
-def get_users(admin: str = Depends(verify_admin)):
-    conn = get_db_connection()
-    cur = conn.cursor()
-    cur.execute("SELECT email, signup_date FROM users")
-    users = [{"email": r[0], "signup_date": r[1], "is_verified": True} for r in cur.fetchall()]
-    cur.close()
-    conn.close()
-    return users
-
-@app.get("/all-listings")
-def get_all(admin: str = Depends(verify_admin)):
-    conn = get_db_connection()
-    cur = conn.cursor()
-    cur.execute("SELECT id, name, location, price_per_day, email FROM listings")
-    rows = cur.fetchall()
-    cur.close()
-    conn.close()
-    return [{"id": r[0], "name": r[1], "location": r[2], "price": r[3], "email": r[4]} for r in rows]
-
 @app.get("/rental-requests")
-def get_rental_requests(admin: str = Depends(verify_admin)):
+def get_all_rental_requests(admin: str = Depends(verify_admin)):
     conn = get_db_connection()
     cur = conn.cursor()
     cur.execute("""
@@ -217,6 +197,54 @@ def get_rental_requests(admin: str = Depends(verify_admin)):
         }
         for row in rows
     ]
+
+@app.get("/my-rental-requests")
+def get_my_rental_requests(user_email: str = Depends(verify_token)):
+    conn = get_db_connection()
+    cur = conn.cursor()
+    cur.execute("""
+        SELECT rr.id, rr.listing_id, l.name, rr.renter_email, rr.lister_email, rr.rental_dates, rr.message, rr.request_time
+        FROM rental_requests rr
+        JOIN listings l ON rr.listing_id = l.id
+        WHERE rr.lister_email = %s
+        ORDER BY rr.request_time DESC
+    """, (user_email,))
+    rows = cur.fetchall()
+    cur.close()
+    conn.close()
+    return [
+        {
+            "id": row[0],
+            "listing_id": row[1],
+            "listing_name": row[2],
+            "renter_email": row[3],
+            "lister_email": row[4],
+            "rental_dates": row[5],
+            "message": row[6],
+            "request_time": row[7].isoformat()
+        }
+        for row in rows
+    ]
+
+@app.get("/users")
+def get_users(admin: str = Depends(verify_admin)):
+    conn = get_db_connection()
+    cur = conn.cursor()
+    cur.execute("SELECT email, signup_date FROM users")
+    users = [{"email": r[0], "signup_date": r[1], "is_verified": True} for r in cur.fetchall()]
+    cur.close()
+    conn.close()
+    return users
+
+@app.get("/all-listings")
+def get_all(admin: str = Depends(verify_admin)):
+    conn = get_db_connection()
+    cur = conn.cursor()
+    cur.execute("SELECT id, name, location, price_per_day, email FROM listings")
+    rows = cur.fetchall()
+    cur.close()
+    conn.close()
+    return [{"id": r[0], "name": r[1], "location": r[2], "price": r[3], "email": r[4]} for r in rows]
 
 @app.delete("/delete-listing")
 def delete_listing(listing_id: str = Form(...), user_email: str = Depends(verify_token)):
@@ -345,6 +373,7 @@ def export_users(admin: str = Depends(verify_admin)):
         media_type="text/csv",
         headers={"Content-Disposition": "attachment; filename=users.csv"}
     )
+
 
 
 
