@@ -3,11 +3,12 @@ uvicorn
 python-multipart
 psycopg2-binary
 bcrypt
-PyJWT
-requests
+python-jose
+python-jwt
 cloudinary
-sendgrid
+requests
 python-dotenv
+
 
 
 
