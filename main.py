@@ -103,37 +103,31 @@ def list_item(
     image: UploadFile = File(...),
     credentials: HTTPAuthorizationCredentials = Depends(security)
 ):
-    try:
-        # Get user email from JWT token
-        token = credentials.credentials
-        payload = jwt.decode(token, JWT_SECRET, algorithms=["HS256"])
-        email = payload.get("email")
-        if not email:
-            raise HTTPException(status_code=401, detail="Unauthorized")
+    token = credentials.credentials
+    payload = jwt.decode(token, JWT_SECRET, algorithms=["HS256"])
+    email = payload.get("email")
+    if not email:
+        raise HTTPException(status_code=401, detail="Unauthorized")
 
-        # Upload image to Cloudinary
-        upload_result = cloudinary.uploader.upload(image.file)
-        image_url = upload_result.get("secure_url")
+    upload_result = cloudinary.uploader.upload(image.file)
+    image_url = upload_result.get("secure_url")
 
-        # Save to database
-        conn = get_db_connection()
-        cur = conn.cursor()
-        cur.execute("""
-            INSERT INTO listings (id, name, location, description, price_per_day, image_url, email)
-            VALUES (%s, %s, %s, %s, %s, %s, %s)
-        """, (str(uuid.uuid4()), name, location, description, price, image_url, email))
-        conn.commit()
-        cur.close()
-        conn.close()
-        return {"message": "Listing created successfully"}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+    conn = get_db_connection()
+    cur = conn.cursor()
+    cur.execute("""
+        INSERT INTO listings (id, name, location, description, price_per_day, image_url, email)
+        VALUES (%s, %s, %s, %s, %s, %s, %s)
+    """, (str(uuid.uuid4()), name, location, description, price, image_url, email))
+    conn.commit()
+    cur.close()
+    conn.close()
+    return {"message": "Listing created successfully"}
 
 @app.get("/listings")
 def get_listings():
     conn = get_db_connection()
     cur = conn.cursor()
-    cur.execute("SELECT id, name, location, description, price_per_day, image_url FROM listings ORDER BY name ASC")
+    cur.execute("SELECT id, name, location, description, price_per_day, image_url, email FROM listings ORDER BY name ASC")
     rows = cur.fetchall()
     cur.close()
     conn.close()
@@ -144,40 +138,38 @@ def get_listings():
             "location": r[2],
             "description": r[3],
             "price": r[4],
-            "image_url": r[5]
+            "image_url": r[5],
+            "email": r[6]
         }
         for r in rows
     ]
 
 @app.post("/request-to-rent")
 def request_to_rent(data: RentalRequest):
-    try:
-        conn = get_db_connection()
-        cur = conn.cursor()
-        cur.execute("SELECT email, name FROM listings WHERE id = %s", (data.listing_id,))
-        result = cur.fetchone()
-        if not result:
-            raise HTTPException(status_code=404, detail="Listing not found")
-        owner_email, item_name = result
+    conn = get_db_connection()
+    cur = conn.cursor()
+    cur.execute("SELECT email, name FROM listings WHERE id = %s", (data.listing_id,))
+    result = cur.fetchone()
+    if not result:
+        raise HTTPException(status_code=404, detail="Listing not found")
+    owner_email, item_name = result
 
-        cur.execute("""
-            INSERT INTO rental_requests (id, listing_id, renter_email, lister_email, rental_dates, message, request_time)
-            VALUES (%s, %s, %s, %s, %s, %s, %s)
-        """, (
-            str(uuid.uuid4()),
-            data.listing_id,
-            data.renter_email,
-            owner_email,
-            ", ".join(data.dates),
-            "Is your item available for rent on this/these days?",
-            datetime.utcnow()
-        ))
-        conn.commit()
-        cur.close()
-        conn.close()
-        return {"message": "Request sent"}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+    cur.execute("""
+        INSERT INTO rental_requests (id, listing_id, renter_email, lister_email, rental_dates, message, request_time)
+        VALUES (%s, %s, %s, %s, %s, %s, %s)
+    """, (
+        str(uuid.uuid4()),
+        data.listing_id,
+        data.renter_email,
+        owner_email,
+        ", ".join(data.dates),
+        "Is your item available for rent on this/these days?",
+        datetime.utcnow()
+    ))
+    conn.commit()
+    cur.close()
+    conn.close()
+    return {"message": "Request sent"}
 
 @app.get("/users")
 def get_users(admin: str = Depends(verify_admin)):
@@ -224,6 +216,70 @@ def get_rental_requests(admin: str = Depends(verify_admin)):
             "request_time": row[7].isoformat()
         }
         for row in rows
+    ]
+
+@app.delete("/delete-listing")
+def delete_listing(listing_id: str = Form(...), user_email: str = Depends(verify_token)):
+    conn = get_db_connection()
+    cur = conn.cursor()
+    cur.execute("DELETE FROM listings WHERE id = %s AND email = %s", (listing_id, user_email))
+    conn.commit()
+    cur.close()
+    conn.close()
+    return {"message": "Listing deleted"}
+
+@app.patch("/edit-listing")
+def edit_listing(
+    listing_id: str = Form(...),
+    name: str = Form(...),
+    location: str = Form(...),
+    description: str = Form(...),
+    price: int = Form(...),
+    image: UploadFile = File(None),
+    user_email: str = Depends(verify_token)
+):
+    conn = get_db_connection()
+    cur = conn.cursor()
+    if image:
+        upload_result = cloudinary.uploader.upload(image.file)
+        image_url = upload_result.get("secure_url")
+        cur.execute("""
+            UPDATE listings
+            SET name = %s, location = %s, description = %s, price_per_day = %s, image_url = %s
+            WHERE id = %s AND email = %s
+        """, (name, location, description, price, image_url, listing_id, user_email))
+    else:
+        cur.execute("""
+            UPDATE listings
+            SET name = %s, location = %s, description = %s, price_per_day = %s
+            WHERE id = %s AND email = %s
+        """, (name, location, description, price, listing_id, user_email))
+    conn.commit()
+    cur.close()
+    conn.close()
+    return {"message": "Listing updated"}
+
+@app.get("/rental-history")
+def rental_history(listing_id: str, user_email: str = Depends(verify_token)):
+    conn = get_db_connection()
+    cur = conn.cursor()
+    cur.execute("""
+        SELECT renter_email, rental_dates, message, request_time
+        FROM rental_requests
+        WHERE listing_id = %s AND lister_email = %s
+        ORDER BY request_time DESC
+    """, (listing_id, user_email))
+    rows = cur.fetchall()
+    cur.close()
+    conn.close()
+    return [
+        {
+            "renter_email": r[0],
+            "rental_dates": r[1],
+            "message": r[2],
+            "request_time": r[3].isoformat()
+        }
+        for r in rows
     ]
 
 @app.post("/admin/add-dummy-rental")
@@ -289,6 +345,7 @@ def export_users(admin: str = Depends(verify_admin)):
         media_type="text/csv",
         headers={"Content-Disposition": "attachment; filename=users.csv"}
     )
+
 
 
 
