@@ -10,9 +10,11 @@ import os
 import requests
 import csv
 from io import StringIO
-from datetime import datetime
+from datetime import datetime, timedelta
 import cloudinary
 import cloudinary.uploader
+from sendgrid import SendGridAPIClient
+from sendgrid.helpers.mail import Mail
 
 # Load environment variables
 DATABASE_URL = os.environ.get("DATABASE_URL")
@@ -30,7 +32,6 @@ cloudinary.config(
 
 app = FastAPI()
 
-# CORS
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -39,7 +40,6 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Auth & DB
 security = HTTPBearer()
 
 def get_db_connection():
@@ -66,6 +66,12 @@ class RentalRequest(BaseModel):
     listing_id: str
     renter_email: str
     dates: list
+
+class MessagePayload(BaseModel):
+    listing_id: str
+    rental_id: str
+    receiver_email: str
+    message: str
 
 @app.post("/signup")
 def signup(auth: AuthRequest):
