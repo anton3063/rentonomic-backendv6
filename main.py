@@ -8,35 +8,39 @@ import jwt
 import uuid
 import os
 import csv
+import requests  # kept: harmless, used in earlier versions
 from io import StringIO
 from datetime import datetime
 import cloudinary
 import cloudinary.uploader
 from typing import Optional, List
 
-# =========================
-# REQUIRED ENV VARS (set these in Render → Environment)
-#   DATABASE_URL
-#   JWT_SECRET
-#   CLOUD_NAME, CLOUD_API_KEY, CLOUD_API_SECRET
-# Optional (fine to be blank until used):
-#   SENDGRID_API_KEY
-#   STRIPE_PUBLISHABLE_KEY, STRIPE_SECRET_KEY, FRONTEND_BASE_URL, STRIPE_WEBHOOK_SECRET
-# =========================
+# 🔶🔶🔶 REQUIRED ENVIRONMENT VARIABLES (set these in Render → Environment) 🔶🔶🔶
+# 🔶 DATABASE_URL            = your Postgres connection string (include ?sslmode=require if needed)
+# 🔶 JWT_SECRET              = a strong random string (e.g., openssl rand -base64 32)
+# 🔶 CLOUD_NAME              = from Cloudinary dashboard
+# 🔶 CLOUD_API_KEY           = from Cloudinary dashboard
+# 🔶 CLOUD_API_SECRET        = from Cloudinary dashboard
+# (Optional for later)
+# 🔶 SENDGRID_API_KEY        = from SendGrid (when email goes live)
+# 🔶 STRIPE_PUBLISHABLE_KEY  = pk_test_… (TEST now; Live later)
+# 🔶 STRIPE_SECRET_KEY       = sk_test_… (TEST now; Live later)
+# 🔶 FRONTEND_BASE_URL       = e.g., https://rentonomic.com
+# 🔶 STRIPE_WEBHOOK_SECRET   = whsec_… (only after you add a webhook in Stripe)
 
 # ---------- Env ----------
 DATABASE_URL = os.environ.get("DATABASE_URL")
-SENDGRID_API_KEY = os.environ.get("SENDGRID_API_KEY")  # reserved for future notifications
+SENDGRID_API_KEY = os.environ.get("SENDGRID_API_KEY")  # optional, not used yet
 JWT_SECRET = os.environ.get("JWT_SECRET", "secret123")
 CLOUD_NAME = os.environ.get("CLOUD_NAME")
 CLOUD_API_KEY = os.environ.get("CLOUD_API_KEY")
 CLOUD_API_SECRET = os.environ.get("CLOUD_API_SECRET")
 
-# --- Stripe (import made safe so deploy never fails if package missing) ---
+# --- Stripe: safe import so deploy never fails if package missing ---
 try:
     import stripe as _stripe
 except Exception:
-    _stripe = None  # will error only when Stripe endpoints are called
+    _stripe = None  # endpoints will error clearly if called without package
 STRIPE_SECRET_KEY = os.environ.get("STRIPE_SECRET_KEY", "")
 STRIPE_PUBLISHABLE_KEY = os.environ.get("STRIPE_PUBLISHABLE_KEY", "")
 FRONTEND_BASE_URL = os.environ.get("FRONTEND_BASE_URL", "")
@@ -44,17 +48,19 @@ STRIPE_WEBHOOK_SECRET = os.environ.get("STRIPE_WEBHOOK_SECRET", "")
 if _stripe and STRIPE_SECRET_KEY:
     _stripe.api_key = STRIPE_SECRET_KEY
 
+# ---------- Cloudinary ----------
 cloudinary.config(
     cloud_name=CLOUD_NAME,
     api_key=CLOUD_API_KEY,
     api_secret=CLOUD_API_SECRET
 )
 
+# ---------- App ----------
 app = FastAPI()
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=["*"],      # keep wide for Netlify/Render combo
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -64,7 +70,7 @@ security = HTTPBearer()
 
 # ---------- DB ----------
 def get_db_connection():
-    # If your provider needs SSL, ensure the DATABASE_URL includes ?sslmode=require
+    # Ensure your DATABASE_URL includes ?sslmode=require if provider needs SSL
     return psycopg2.connect(DATABASE_URL)
 
 # ---------- Auth helpers ----------
@@ -555,6 +561,8 @@ def stripe_create_onboarding_link(current_user: str = Depends(verify_token)):
         type="account_onboarding",
     )
     return {"url": link["url"], "account_id": acct_id}
+
+
 
 
 
