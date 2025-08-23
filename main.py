@@ -1,4 +1,4 @@
-from fastapi import FastAPI, HTTPException, Request, Depends, Form, UploadFile, File, Response
+from fastapi import FastAPI, HTTPException, Depends, Form, UploadFile, File, Response
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from pydantic import BaseModel
@@ -12,6 +12,7 @@ from io import StringIO
 from datetime import datetime
 import cloudinary
 import cloudinary.uploader
+from typing import Optional, List
 
 # ---------- Env ----------
 DATABASE_URL = os.environ.get("DATABASE_URL")
@@ -41,10 +42,11 @@ security = HTTPBearer()
 
 # ---------- DB ----------
 def get_db_connection():
+    # If your provider needs SSL, ensure the DATABASE_URL includes ?sslmode=require
     return psycopg2.connect(DATABASE_URL)
 
 # ---------- Auth helpers ----------
-def verify_token(credentials: HTTPAuthorizationCredentials = Depends(security)):
+def verify_token(credentials: HTTPAuthorizationCredentials = Depends(security)) -> str:
     if not credentials or not credentials.credentials:
         raise HTTPException(status_code=401, detail="Missing auth token")
     token = credentials.credentials
@@ -57,7 +59,7 @@ def verify_token(credentials: HTTPAuthorizationCredentials = Depends(security)):
         raise HTTPException(status_code=401, detail="Invalid auth payload")
     return email
 
-def verify_admin(credentials: HTTPAuthorizationCredentials = Depends(security)):
+def verify_admin(credentials: HTTPAuthorizationCredentials = Depends(security)) -> str:
     email = verify_token(credentials)
     if email != "admin@rentonomic.com":
         raise HTTPException(status_code=403, detail="Admin access only")
@@ -70,8 +72,8 @@ class AuthRequest(BaseModel):
 
 class RentalRequest(BaseModel):
     listing_id: str
-    renter_email: str | None = None   # will be ignored (we use token)
-    dates: list[str] | None = None    # optional legacy support
+    renter_email: Optional[str] = None   # ignored; we use token
+    dates: Optional[List[str]] = None    # optional legacy support
 
 # ---------- Auth ----------
 @app.post("/signup")
@@ -130,7 +132,7 @@ def list_item(
     cur.close(); conn.close()
     return {"message": "Listing created successfully"}
 
-def _outward_code(loc: str | None) -> str:
+def _outward_code(loc: Optional[str]) -> str:
     if not loc:
         return ""
     parts = loc.strip().split()
@@ -480,28 +482,6 @@ def export_users(admin: str = Depends(verify_admin)):
         media_type="text/csv",
         headers={"Content-Disposition": "attachment; filename=users.csv"}
     )
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 
 
 
