@@ -88,6 +88,43 @@ def verify_admin(credentials: HTTPAuthorizationCredentials = Depends(security)) 
     if email != "admin@rentonomic.com":
         raise HTTPException(status_code=403, detail="Admin access only")
     return email
+    def get_or_create_connect_account(user_email: str) -> str:
+    """
+    Return an existing Stripe Connect account id for this user,
+    or create & save a new Express account (UK). Idempotent.
+    """
+    # 1) Do we already have one?
+    conn = get_db_connection()
+    cur = conn.cursor()
+    cur.execute("SELECT stripe_account_id FROM users WHERE email = %s", (user_email,))
+    row = cur.fetchone()
+    if row and row[0]:
+        acct_id = row[0]
+        cur.close(); conn.close()
+        return acct_id
+
+    # 2) Create a new Express account (TEST mode now)
+    acct = stripe.Account.create(
+        type="express",
+        country="GB",
+        email=user_email,
+        capabilities={
+            "card_payments": {"requested": True},
+            "transfers": {"requested": True},
+        },
+        business_type="individual",
+    )
+    acct_id = acct["id"]
+
+    # 3) Save it back to users.stripe_account_id
+    cur.execute(
+        "UPDATE users SET stripe_account_id = %s WHERE email = %s",
+        (acct_id, user_email)
+    )
+    conn.commit()
+    cur.close(); conn.close()
+    return acct_id
+
 
 # ---------- Models ----------
 class AuthRequest(BaseModel):
@@ -506,6 +543,7 @@ def export_users(admin: str = Depends(verify_admin)):
         media_type="text/csv",
         headers={"Content-Disposition": "attachment; filename=users.csv"}
     )
+
 
 
 
