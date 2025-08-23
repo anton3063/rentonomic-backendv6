@@ -14,6 +14,21 @@ import cloudinary
 import cloudinary.uploader
 from typing import Optional, List
 
+# 🔶🔶🔶 REQUIRED ENVIRONMENT VARIABLES (set these in Render → Environment) 🔶🔶🔶
+# 🔶 DATABASE_URL            = your Postgres connection string (include sslmode=require if needed)
+# 🔶 JWT_SECRET              = a strong random string (e.g., openssl rand -base64 32)
+# 🔶 CLOUD_NAME              = from Cloudinary dashboard
+# 🔶 CLOUD_API_KEY           = from Cloudinary dashboard
+# 🔶 CLOUD_API_SECRET        = from Cloudinary dashboard
+# (Optional now, can be blank)
+# 🔶 SENDGRID_API_KEY        = from SendGrid (only when email goes live)
+#
+# 🔶 STRIPE_PUBLISHABLE_KEY  = pk_test_… (TEST for now; Live later)
+# 🔶 STRIPE_SECRET_KEY       = sk_test_… (TEST for now; Live later)
+# (Optional now; used later when adding webhooks / success URLs)
+# 🔶 FRONTEND_BASE_URL       = e.g., https://rentonomic.com
+# 🔶 STRIPE_WEBHOOK_SECRET   = whsec_… (only after you add the webhook in Stripe)
+
 # ---------- Env ----------
 DATABASE_URL = os.environ.get("DATABASE_URL")
 SENDGRID_API_KEY = os.environ.get("SENDGRID_API_KEY")  # reserved for future notifications
@@ -21,6 +36,15 @@ JWT_SECRET = os.environ.get("JWT_SECRET", "secret123")
 CLOUD_NAME = os.environ.get("CLOUD_NAME")
 CLOUD_API_KEY = os.environ.get("CLOUD_API_KEY")
 CLOUD_API_SECRET = os.environ.get("CLOUD_API_SECRET")
+
+# --- Stripe (additive wiring only; no behavior change yet) ---
+import stripe
+STRIPE_SECRET_KEY = os.environ.get("STRIPE_SECRET_KEY", "")
+STRIPE_PUBLISHABLE_KEY = os.environ.get("STRIPE_PUBLISHABLE_KEY", "")
+FRONTEND_BASE_URL = os.environ.get("FRONTEND_BASE_URL", "")
+STRIPE_WEBHOOK_SECRET = os.environ.get("STRIPE_WEBHOOK_SECRET", "")  # not used yet
+if STRIPE_SECRET_KEY:
+    stripe.api_key = STRIPE_SECRET_KEY
 
 cloudinary.config(
     cloud_name=CLOUD_NAME,
@@ -162,7 +186,7 @@ def get_listings():
             "name": r[1],
             "location": _outward_code(r[2]),
             "description": r[3],
-            "renter_price": renter_price,
+            "renter_price": renter_price,   # renter sees base×1.10; lister keeps base
             "image_url": r[5]
         })
     return data
