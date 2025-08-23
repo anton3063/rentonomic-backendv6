@@ -124,6 +124,23 @@ def verify_admin(credentials: HTTPAuthorizationCredentials = Depends(security)) 
     conn.commit()
     cur.close(); conn.close()
     return acct_id
+    @app.post("/stripe/create-onboarding-link")
+def stripe_create_onboarding_link(current_user: str = Depends(verify_token)):
+    # Basic safety: make sure required Stripe config exists
+    if not STRIPE_SECRET_KEY or not STRIPE_PUBLISHABLE_KEY or not FRONTEND_BASE_URL:
+        raise HTTPException(status_code=500, detail="Stripe not configured")
+
+    # Get existing Connect account or create a new one, then build an onboarding link
+    acct_id = get_or_create_connect_account(current_user)
+
+    link = stripe.AccountLink.create(
+        account=acct_id,
+        refresh_url=f"{FRONTEND_BASE_URL}/dashboard.html?stripe=refresh",
+        return_url=f"{FRONTEND_BASE_URL}/dashboard.html?stripe=return",
+        type="account_onboarding",
+    )
+    return {"url": link["url"], "account_id": acct_id}
+
 
 
 # ---------- Models ----------
@@ -543,6 +560,7 @@ def export_users(admin: str = Depends(verify_admin)):
         media_type="text/csv",
         headers={"Content-Disposition": "attachment; filename=users.csv"}
     )
+
 
 
 
