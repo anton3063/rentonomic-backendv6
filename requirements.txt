@@ -9,7 +9,7 @@ cloudinary
 requests
 python-jose[cryptography]
 sendgrid
-
+stripe
 
 
 
@@ -25,6 +25,7 @@ sendgrid
 
 
               
+
 
 
 
