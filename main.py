@@ -14,20 +14,15 @@ import cloudinary
 import cloudinary.uploader
 from typing import Optional, List
 
-# 🔶🔶🔶 REQUIRED ENVIRONMENT VARIABLES (set these in Render → Environment) 🔶🔶🔶
-# 🔶 DATABASE_URL            = your Postgres connection string (include sslmode=require if needed)
-# 🔶 JWT_SECRET              = a strong random string (e.g., openssl rand -base64 32)
-# 🔶 CLOUD_NAME              = from Cloudinary dashboard
-# 🔶 CLOUD_API_KEY           = from Cloudinary dashboard
-# 🔶 CLOUD_API_SECRET        = from Cloudinary dashboard
-# (Optional now, can be blank)
-# 🔶 SENDGRID_API_KEY        = from SendGrid (only when email goes live)
-#
-# 🔶 STRIPE_PUBLISHABLE_KEY  = pk_test_… (TEST for now; Live later)
-# 🔶 STRIPE_SECRET_KEY       = sk_test_… (TEST for now; Live later)
-# (Optional now; used later when adding webhooks / success URLs)
-# 🔶 FRONTEND_BASE_URL       = e.g., https://rentonomic.com
-# 🔶 STRIPE_WEBHOOK_SECRET   = whsec_… (only after you add the webhook in Stripe)
+# =========================
+# REQUIRED ENV VARS (set these in Render → Environment)
+#   DATABASE_URL
+#   JWT_SECRET
+#   CLOUD_NAME, CLOUD_API_KEY, CLOUD_API_SECRET
+# Optional (fine to be blank until used):
+#   SENDGRID_API_KEY
+#   STRIPE_PUBLISHABLE_KEY, STRIPE_SECRET_KEY, FRONTEND_BASE_URL, STRIPE_WEBHOOK_SECRET
+# =========================
 
 # ---------- Env ----------
 DATABASE_URL = os.environ.get("DATABASE_URL")
@@ -37,14 +32,17 @@ CLOUD_NAME = os.environ.get("CLOUD_NAME")
 CLOUD_API_KEY = os.environ.get("CLOUD_API_KEY")
 CLOUD_API_SECRET = os.environ.get("CLOUD_API_SECRET")
 
-# --- Stripe (additive wiring only; no behavior change yet) ---
-import stripe
+# --- Stripe (import made safe so deploy never fails if package missing) ---
+try:
+    import stripe as _stripe
+except Exception:
+    _stripe = None  # will error only when Stripe endpoints are called
 STRIPE_SECRET_KEY = os.environ.get("STRIPE_SECRET_KEY", "")
 STRIPE_PUBLISHABLE_KEY = os.environ.get("STRIPE_PUBLISHABLE_KEY", "")
 FRONTEND_BASE_URL = os.environ.get("FRONTEND_BASE_URL", "")
-STRIPE_WEBHOOK_SECRET = os.environ.get("STRIPE_WEBHOOK_SECRET", "")  # not used yet
-if STRIPE_SECRET_KEY:
-    stripe.api_key = STRIPE_SECRET_KEY
+STRIPE_WEBHOOK_SECRET = os.environ.get("STRIPE_WEBHOOK_SECRET", "")
+if _stripe and STRIPE_SECRET_KEY:
+    _stripe.api_key = STRIPE_SECRET_KEY
 
 cloudinary.config(
     cloud_name=CLOUD_NAME,
@@ -88,12 +86,18 @@ def verify_admin(credentials: HTTPAuthorizationCredentials = Depends(security)) 
     if email != "admin@rentonomic.com":
         raise HTTPException(status_code=403, detail="Admin access only")
     return email
-    def get_or_create_connect_account(user_email: str) -> str:
+
+# ---------- Stripe Connect helper ----------
+def get_or_create_connect_account(user_email: str) -> str:
     """
     Return an existing Stripe Connect account id for this user,
     or create & save a new Express account (UK). Idempotent.
     """
-    # 1) Do we already have one?
+    if not _stripe:
+        raise HTTPException(status_code=500, detail="Stripe library not installed")
+    if not STRIPE_SECRET_KEY:
+        raise HTTPException(status_code=500, detail="Stripe not configured")
+
     conn = get_db_connection()
     cur = conn.cursor()
     cur.execute("SELECT stripe_account_id FROM users WHERE email = %s", (user_email,))
@@ -103,45 +107,19 @@ def verify_admin(credentials: HTTPAuthorizationCredentials = Depends(security)) 
         cur.close(); conn.close()
         return acct_id
 
-    # 2) Create a new Express account (TEST mode now)
-    acct = stripe.Account.create(
+    acct = _stripe.Account.create(
         type="express",
         country="GB",
         email=user_email,
-        capabilities={
-            "card_payments": {"requested": True},
-            "transfers": {"requested": True},
-        },
+        capabilities={"card_payments": {"requested": True}, "transfers": {"requested": True}},
         business_type="individual",
     )
     acct_id = acct["id"]
 
-    # 3) Save it back to users.stripe_account_id
-    cur.execute(
-        "UPDATE users SET stripe_account_id = %s WHERE email = %s",
-        (acct_id, user_email)
-    )
+    cur.execute("UPDATE users SET stripe_account_id = %s WHERE email = %s", (acct_id, user_email))
     conn.commit()
     cur.close(); conn.close()
     return acct_id
-    @app.post("/stripe/create-onboarding-link")
-def stripe_create_onboarding_link(current_user: str = Depends(verify_token)):
-    # Basic safety: make sure required Stripe config exists
-    if not STRIPE_SECRET_KEY or not STRIPE_PUBLISHABLE_KEY or not FRONTEND_BASE_URL:
-        raise HTTPException(status_code=500, detail="Stripe not configured")
-
-    # Get existing Connect account or create a new one, then build an onboarding link
-    acct_id = get_or_create_connect_account(current_user)
-
-    link = stripe.AccountLink.create(
-        account=acct_id,
-        refresh_url=f"{FRONTEND_BASE_URL}/dashboard.html?stripe=refresh",
-        return_url=f"{FRONTEND_BASE_URL}/dashboard.html?stripe=return",
-        type="account_onboarding",
-    )
-    return {"url": link["url"], "account_id": acct_id}
-
-
 
 # ---------- Models ----------
 class AuthRequest(BaseModel):
@@ -561,18 +539,22 @@ def export_users(admin: str = Depends(verify_admin)):
         headers={"Content-Disposition": "attachment; filename=users.csv"}
     )
 
+# ---------- Stripe: create onboarding link ----------
+@app.post("/stripe/create-onboarding-link")
+def stripe_create_onboarding_link(current_user: str = Depends(verify_token)):
+    if not _stripe:
+        raise HTTPException(status_code=500, detail="Stripe library not installed")
+    if not STRIPE_SECRET_KEY or not STRIPE_PUBLISHABLE_KEY or not FRONTEND_BASE_URL:
+        raise HTTPException(status_code=500, detail="Stripe not configured")
 
-
-
-
-
-
-
-
-
-
-
-
+    acct_id = get_or_create_connect_account(current_user)
+    link = _stripe.AccountLink.create(
+        account=acct_id,
+        refresh_url=f"{FRONTEND_BASE_URL}/dashboard.html?stripe=refresh",
+        return_url=f"{FRONTEND_BASE_URL}/dashboard.html?stripe=return",
+        type="account_onboarding",
+    )
+    return {"url": link["url"], "account_id": acct_id}
 
 
 
