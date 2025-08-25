@@ -9,7 +9,7 @@ import uuid
 import os
 import csv
 import json
-import requests  # harmless, kept for earlier versions
+import requests  # kept: harmless, used in earlier versions
 from io import StringIO
 from datetime import datetime, date
 import cloudinary
@@ -56,7 +56,7 @@ security = HTTPBearer()
 
 # ---------- DB ----------
 def get_db_connection():
-    # Ensure DATABASE_URL includes ?sslmode=require (Render Postgres)
+    # Ensure DATABASE_URL includes ?sslmode=require when needed
     return psycopg2.connect(DATABASE_URL)
 
 # ---------- Health ----------
@@ -87,8 +87,7 @@ def verify_admin(credentials: HTTPAuthorizationCredentials = Depends(security)) 
 # ---------- Stripe Connect helper ----------
 def get_or_create_connect_account(user_email: str) -> str:
     """
-    Return an existing Stripe Connect account id for this user,
-    or create & save a new Express account (UK). Idempotent.
+    Return an existing Stripe Connect account id for this user, or create one (Express UK).
     """
     if not _stripe:
         raise HTTPException(status_code=500, detail="Stripe library not installed")
@@ -259,11 +258,26 @@ def my_listings(user_email: str = Depends(verify_token)):
 
 @app.delete("/delete-listing/{listing_id}")
 def delete_listing(listing_id: str, user_email: str = Depends(verify_token)):
+    """
+    Normal users: can delete their own listing.
+    Admin: can delete any listing by id (no owner check).
+    Returns 404 if nothing was deleted.
+    """
     conn = get_db_connection()
     cur = conn.cursor()
-    cur.execute("DELETE FROM listings WHERE id = %s AND email = %s", (listing_id, user_email))
+
+    if user_email == "admin@rentonomic.com":
+        cur.execute("DELETE FROM listings WHERE id = %s", (listing_id,))
+    else:
+        cur.execute("DELETE FROM listings WHERE id = %s AND email = %s", (listing_id, user_email))
+
+    deleted = cur.rowcount
     conn.commit()
     cur.close(); conn.close()
+
+    if deleted == 0:
+        raise HTTPException(status_code=404, detail="Listing not found or not owned by you")
+
     return {"message": "Listing deleted"}
 
 @app.patch("/edit-listing")
@@ -339,13 +353,11 @@ def rental_history_path(listing_id: str, user_email: str = Depends(verify_token)
 @app.post("/request-to-rent")
 def request_to_rent(data: RentalRequest, renter_email_from_token: str = Depends(verify_token)):
     """
-    Legacy-compatible JSON endpoint.
-    Ignores client-sent renter_email and uses token email. Dates field is a list.
+    Legacy-compatible JSON endpoint. Ignores client-sent renter_email and uses token email.
     """
     conn = get_db_connection()
     cur = conn.cursor()
 
-    # owner email + item name
     cur.execute("SELECT email, name FROM listings WHERE id = %s", (data.listing_id,))
     listing = cur.fetchone()
     if not listing:
@@ -546,6 +558,72 @@ def export_users(admin: str = Depends(verify_admin)):
         headers={"Content-Disposition": "attachment; filename=users.csv"}
     )
 
+# --- Admin power tools (explicit endpoints) ---
+@app.delete("/admin/delete-listing/{listing_id}")
+def admin_delete_listing(listing_id: str, admin: str = Depends(verify_admin)):
+    conn = get_db_connection(); cur = conn.cursor()
+    # Clean up child data first
+    cur.execute("""
+        DELETE FROM messages
+        WHERE thread_id IN (
+            SELECT id FROM message_threads WHERE listing_id = %s
+        )
+    """, (listing_id,))
+    cur.execute("DELETE FROM message_threads WHERE listing_id = %s", (listing_id,))
+    cur.execute("DELETE FROM rentals WHERE listing_id = %s", (listing_id,))
+    cur.execute("DELETE FROM rental_requests WHERE listing_id = %s", (listing_id,))
+    cur.execute("DELETE FROM listings WHERE id = %s", (listing_id,))
+    deleted = cur.rowcount
+    conn.commit(); cur.close(); conn.close()
+    if deleted == 0:
+        raise HTTPException(status_code=404, detail="Listing not found")
+    return {"message": "Listing and related records deleted"}
+
+@app.delete("/admin/delete-user/{email}")
+def admin_delete_user(email: str, admin: str = Depends(verify_admin)):
+    conn = get_db_connection(); cur = conn.cursor()
+    # Messages -> Threads -> Rentals -> Legacy requests -> Listings -> User
+    cur.execute("""
+        DELETE FROM messages
+        WHERE thread_id IN (
+            SELECT id FROM message_threads
+            WHERE renter_email = %s OR lister_email = %s
+        )
+    """, (email, email))
+    cur.execute("DELETE FROM message_threads WHERE renter_email = %s OR lister_email = %s", (email, email))
+    cur.execute("DELETE FROM rentals WHERE renter_email = %s OR lister_email = %s", (email, email))
+    cur.execute("DELETE FROM rental_requests WHERE renter_email = %s OR lister_email = %s", (email, email))
+    cur.execute("DELETE FROM listings WHERE email = %s", (email,))
+    listings_deleted = cur.rowcount
+    cur.execute("DELETE FROM users WHERE email = %s", (email,))
+    users_deleted = cur.rowcount
+    conn.commit(); cur.close(); conn.close()
+    if users_deleted == 0:
+        raise HTTPException(status_code=404, detail="User not found")
+    return {"message": "User deleted", "listings_deleted": listings_deleted}
+
+@app.delete("/admin/delete-orphan-listings")
+def admin_delete_orphans(admin: str = Depends(verify_admin)):
+    conn = get_db_connection(); cur = conn.cursor()
+    cur.execute("""
+        DELETE FROM messages WHERE thread_id IN (
+            SELECT id FROM message_threads WHERE listing_id IN (
+                SELECT id FROM listings WHERE email IS NULL OR email = ''
+            )
+        )
+    """)
+    cur.execute("""
+        DELETE FROM message_threads WHERE listing_id IN (
+            SELECT id FROM listings WHERE email IS NULL OR email = ''
+        )
+    """)
+    cur.execute("DELETE FROM rentals WHERE listing_id IN (SELECT id FROM listings WHERE email IS NULL OR email = '')")
+    cur.execute("DELETE FROM rental_requests WHERE listing_id IN (SELECT id FROM listings WHERE email IS NULL OR email = '')")
+    cur.execute("DELETE FROM listings WHERE email IS NULL OR email = ''")
+    deleted = cur.rowcount
+    conn.commit(); cur.close(); conn.close()
+    return {"message": "Orphan listings deleted", "count": deleted}
+
 # ---------- Stripe: create onboarding link ----------
 @app.post("/stripe/create-onboarding-link")
 def stripe_create_onboarding_link(current_user: str = Depends(verify_token)):
@@ -587,7 +665,172 @@ def create_checkout_session(payload: CheckoutIn, current_user: str = Depends(ver
     # Ensure lister has a Stripe Connect account
     cur.execute("SELECT stripe_account_id FROM users WHERE email = %s", (lister_email,))
     row2 = cur.fetchone()
-    i
+    if not row2 or not row2[0]:
+        cur.close(); conn.close()
+        raise HTTPException(status_code=400, detail="Owner has not completed Stripe onboarding")
+    destination_acct = row2[0]
+
+    base_pence = int(price_per_day) * 100
+    renter_pence = int(round(base_pence * 1.10))
+    fee_pence = renter_pence - base_pence
+
+    session = _stripe.checkout.Session.create(
+        mode="payment",
+        payment_method_types=["card"],
+        line_items=[{
+            "price_data": {
+                "currency": "gbp",
+                "unit_amount": renter_pence,
+                "product_data": {"name": f"Rent {name}"}
+            },
+            "quantity": 1
+        }],
+        success_url=f"{FRONTEND_BASE_URL}/dashboard.html?checkout=success&session_id={{CHECKOUT_SESSION_ID}}",
+        cancel_url=f"{FRONTEND_BASE_URL}/dashboard.html?checkout=cancelled",
+        customer_email=current_user,
+        payment_intent_data={
+            "application_fee_amount": fee_pence,
+            "transfer_data": {"destination": destination_acct}
+        }
+    )
+
+    cur.execute("""
+        INSERT INTO rentals (listing_id, renter_email, lister_email,
+            start_date, end_date, base_pence, renter_pence, fee_pence,
+            stripe_session_id, status)
+        VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,'pending')
+    """, (
+        listing_id, current_user, lister_email,
+        payload.start_date, payload.end_date,
+        base_pence, renter_pence, fee_pence,
+        session["id"]
+    ))
+    conn.commit()
+    cur.close(); conn.close()
+    return {"url": session["url"]}
+
+@app.post("/stripe/webhook")
+async def stripe_webhook(request: Request):
+    if not _stripe:
+        raise HTTPException(status_code=500, detail="Stripe library not installed")
+
+    payload_bytes = await request.body()
+    sig_header = request.headers.get("Stripe-Signature")
+
+    # Verify when secret exists; otherwise accept (dev)
+    if STRIPE_WEBHOOK_SECRET:
+        try:
+            event = _stripe.Webhook.construct_event(
+                payload=payload_bytes, sig_header=sig_header, secret=STRIPE_WEBHOOK_SECRET
+            )
+        except Exception:
+            raise HTTPException(status_code=400, detail="Invalid webhook signature")
+        etype = event.get("type")
+        data = event.get("data", {}).get("object", {})
+    else:
+        # Fallback parse without signature
+        try:
+            data_raw = json.loads(payload_bytes.decode("utf-8"))
+        except Exception:
+            data_raw = {}
+        etype = data_raw.get("type")
+        data = data_raw.get("data", {}).get("object", {}) if isinstance(data_raw, dict) else {}
+
+    conn = get_db_connection()
+    cur = conn.cursor()
+
+    if etype == "checkout.session.completed":
+        session_id = data.get("id")
+        payment_intent_id = data.get("payment_intent")
+        cur.execute("""
+            UPDATE rentals
+            SET status='paid', stripe_payment_intent_id=%s
+            WHERE stripe_session_id=%s
+            RETURNING id, listing_id, renter_email, lister_email
+        """, (payment_intent_id, session_id))
+        rental = cur.fetchone()
+        if rental:
+            rid, lid, renter_email, lister_email = rental
+            cur.execute("""
+                INSERT INTO message_threads (rental_id, listing_id, renter_email, lister_email, is_unlocked)
+                VALUES (%s,%s,%s,%s,TRUE)
+                ON CONFLICT DO NOTHING
+            """, (rid, str(lid), renter_email, lister_email))
+    elif etype in ("checkout.session.expired", "checkout.session.async_payment_failed"):
+        session_id = data.get("id")
+        new_status = "expired" if etype.endswith("expired") else "canceled"
+        cur.execute("UPDATE rentals SET status=%s WHERE stripe_session_id=%s", (new_status, session_id))
+
+    conn.commit()
+    cur.close(); conn.close()
+    return {"received": True}
+
+# ---------- Messaging ----------
+@app.get("/messages/thread/{listing_id}")
+def get_thread(listing_id: str, current_user: str = Depends(verify_token)):
+    conn = get_db_connection()
+    cur = conn.cursor()
+    cur.execute("""
+        SELECT t.id, t.is_unlocked, t.renter_email, t.lister_email
+        FROM message_threads t
+        WHERE t.listing_id = %s AND t.is_unlocked = TRUE
+          AND (t.renter_email = %s OR t.lister_email = %s)
+        ORDER BY t.id DESC LIMIT 1
+    """, (listing_id, current_user, current_user))
+    thread = cur.fetchone()
+
+    if not thread:
+        # If user has a rental but not paid yet, show locked message
+        cur.execute("""
+            SELECT status FROM rentals
+            WHERE listing_id = %s AND (renter_email = %s OR lister_email = %s)
+            ORDER BY id DESC LIMIT 1
+        """, (listing_id, current_user, current_user))
+        r = cur.fetchone()
+        cur.close(); conn.close()
+        if r and r[0] != "paid":
+            raise HTTPException(status_code=403, detail="Messaging locked until payment")
+        raise HTTPException(status_code=404, detail="No message thread")
+
+    thread_id, _, renter, lister = thread
+    cur.execute("""
+        SELECT id, sender_email, body, created_at
+        FROM messages
+        WHERE thread_id = %s
+        ORDER BY created_at ASC
+    """, (thread_id,))
+    msgs = [{"id": m[0], "sender_email": m[1], "body": m[2], "created_at": m[3].isoformat()} for m in cur.fetchall()]
+    cur.close(); conn.close()
+    return {"thread_id": thread_id, "renter_email": renter, "lister_email": lister, "messages": msgs}
+
+@app.post("/messages/send")
+def send_message(payload: MessageSendIn, current_user: str = Depends(verify_token)):
+    conn = get_db_connection()
+    cur = conn.cursor()
+    cur.execute("SELECT renter_email, lister_email, is_unlocked FROM message_threads WHERE id = %s", (payload.thread_id,))
+    row = cur.fetchone()
+    if not row:
+        cur.close(); conn.close()
+        raise HTTPException(status_code=404, detail="Thread not found")
+    renter, lister, unlocked = row
+    if not unlocked:
+        cur.close(); conn.close()
+        raise HTTPException(status_code=403, detail="Messaging locked")
+    if current_user not in (renter, lister):
+        cur.close(); conn.close()
+        raise HTTPException(status_code=403, detail="Not a participant")
+
+    cur.execute("""
+        INSERT INTO messages (thread_id, sender_email, body)
+        VALUES (%s, %s, %s)
+        RETURNING id, created_at
+    """, (payload.thread_id, current_user, payload.body))
+    mid, created = cur.fetchone()
+    conn.commit()
+    cur.close(); conn.close()
+    return {"id": mid, "sender_email": current_user, "body": payload.body, "created_at": created.isoformat()}
+
+
 
 
 
