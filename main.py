@@ -9,14 +9,14 @@ import uuid
 import os
 import csv
 import json
-import requests  # kept: harmless, used in earlier versions
+import requests  # kept for earlier versions (harmless)
 from io import StringIO
 from datetime import datetime, date
 import cloudinary
 import cloudinary.uploader
 from typing import Optional, List
 
-# 🔶🔶🔶 REQUIRED ENVIRONMENT VARIABLES (Render → Environment) 🔶🔶🔶
+# ========= ENV =========
 DATABASE_URL = os.environ.get("DATABASE_URL")
 SENDGRID_API_KEY = os.environ.get("SENDGRID_API_KEY")  # optional
 JWT_SECRET = os.environ.get("JWT_SECRET", "secret123")
@@ -36,35 +36,35 @@ STRIPE_WEBHOOK_SECRET = os.environ.get("STRIPE_WEBHOOK_SECRET", "")
 if _stripe and STRIPE_SECRET_KEY:
     _stripe.api_key = STRIPE_SECRET_KEY
 
-# ---------- Cloudinary ----------
+# --- Cloudinary ---
 cloudinary.config(
     cloud_name=CLOUD_NAME,
     api_key=CLOUD_API_KEY,
     api_secret=CLOUD_API_SECRET
 )
 
-# ---------- App ----------
+# ========= APP =========
 app = FastAPI()
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # Netlify + Render
+    allow_origins=["*"],   # Netlify + Render
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 security = HTTPBearer()
 
-# ---------- DB ----------
+# ========= DB =========
 def get_db_connection():
-    # Ensure DATABASE_URL includes ?sslmode=require when needed
+    # Render Postgres usually needs ?sslmode=require in the URL (already in your env)
     return psycopg2.connect(DATABASE_URL)
 
-# ---------- Health ----------
+# ========= HEALTH =========
 @app.get("/health")
 def health():
     return {"ok": True}
 
-# ---------- Auth helpers ----------
+# ========= AUTH HELPERS =========
 def verify_token(credentials: HTTPAuthorizationCredentials = Depends(security)) -> str:
     if not credentials or not credentials.credentials:
         raise HTTPException(status_code=401, detail="Missing auth token")
@@ -84,11 +84,8 @@ def verify_admin(credentials: HTTPAuthorizationCredentials = Depends(security)) 
         raise HTTPException(status_code=403, detail="Admin access only")
     return email
 
-# ---------- Stripe Connect helper ----------
+# ========= STRIPE CONNECT HELPER =========
 def get_or_create_connect_account(user_email: str) -> str:
-    """
-    Return an existing Stripe Connect account id for this user, or create one (Express UK).
-    """
     if not _stripe:
         raise HTTPException(status_code=500, detail="Stripe library not installed")
     if not STRIPE_SECRET_KEY:
@@ -117,7 +114,7 @@ def get_or_create_connect_account(user_email: str) -> str:
     cur.close(); conn.close()
     return acct_id
 
-# ---------- Models ----------
+# ========= MODELS =========
 class AuthRequest(BaseModel):
     email: str
     password: str
@@ -125,9 +122,8 @@ class AuthRequest(BaseModel):
 class RentalRequest(BaseModel):
     listing_id: str
     renter_email: Optional[str] = None   # ignored; we use token
-    dates: Optional[List[str]] = None    # optional legacy support
+    dates: Optional[List[str]] = None    # legacy support
 
-# Payments / messaging
 class CheckoutIn(BaseModel):
     listing_id: str
     start_date: Optional[date] = None
@@ -137,11 +133,10 @@ class MessageSendIn(BaseModel):
     thread_id: int
     body: str
 
-# ---------- Auth ----------
+# ========= AUTH =========
 @app.post("/signup")
 def signup(auth: AuthRequest):
-    conn = get_db_connection()
-    cur = conn.cursor()
+    conn = get_db_connection(); cur = conn.cursor()
     cur.execute("SELECT 1 FROM users WHERE email = %s", (auth.email,))
     if cur.fetchone():
         cur.close(); conn.close()
@@ -158,8 +153,7 @@ def signup(auth: AuthRequest):
 
 @app.post("/login")
 def login(auth: AuthRequest):
-    conn = get_db_connection()
-    cur = conn.cursor()
+    conn = get_db_connection(); cur = conn.cursor()
     cur.execute("SELECT password FROM users WHERE email = %s", (auth.email,))
     row = cur.fetchone()
     if not row or not bcrypt.checkpw(auth.password.encode(), row[0].encode()):
@@ -169,7 +163,7 @@ def login(auth: AuthRequest):
     token = jwt.encode({"email": auth.email}, JWT_SECRET, algorithm="HS256")
     return {"token": token}
 
-# ---------- Listings ----------
+# ========= LISTINGS =========
 @app.post("/list")
 def list_item(
     name: str = Form(...),
@@ -179,13 +173,10 @@ def list_item(
     image: UploadFile = File(...),
     user_email: str = Depends(verify_token)
 ):
-    # Upload to Cloudinary
     upload_result = cloudinary.uploader.upload(image.file)
     image_url = upload_result.get("secure_url")
 
-    # Insert tied to authenticated user
-    conn = get_db_connection()
-    cur = conn.cursor()
+    conn = get_db_connection(); cur = conn.cursor()
     cur.execute("""
         INSERT INTO listings (id, name, location, description, price_per_day, image_url, email)
         VALUES (%s, %s, %s, %s, %s, %s, %s)
@@ -195,18 +186,13 @@ def list_item(
     return {"message": "Listing created successfully"}
 
 def _outward_code(loc: Optional[str]) -> str:
-    if not loc:
-        return ""
+    if not loc: return ""
     parts = loc.strip().split()
     return parts[0].upper()
 
 @app.get("/listings")
 def get_listings():
-    """
-    Public feed: outward code only, renter price (base * 1.10), no owner email.
-    """
-    conn = get_db_connection()
-    cur = conn.cursor()
+    conn = get_db_connection(); cur = conn.cursor()
     cur.execute("""
         SELECT id, name, location, description, price_per_day, image_url
         FROM listings
@@ -215,27 +201,22 @@ def get_listings():
     rows = cur.fetchall()
     cur.close(); conn.close()
 
-    data = []
+    out = []
     for r in rows:
         base = r[4] or 0
-        renter_price = round(float(base) * 1.10, 2)
-        data.append({
+        out.append({
             "id": r[0],
             "name": r[1],
             "location": _outward_code(r[2]),
             "description": r[3],
-            "renter_price": renter_price,   # renter sees base×1.10; lister keeps base
+            "renter_price": round(float(base) * 1.10, 2),  # renter sees base×1.10
             "image_url": r[5]
         })
-    return data
+    return out
 
 @app.get("/my-listings")
 def my_listings(user_email: str = Depends(verify_token)):
-    """
-    Owner's own listings (dashboard). We can return full location (owner view).
-    """
-    conn = get_db_connection()
-    cur = conn.cursor()
+    conn = get_db_connection(); cur = conn.cursor()
     cur.execute("""
         SELECT id, name, location, description, price_per_day, image_url
         FROM listings
@@ -244,40 +225,26 @@ def my_listings(user_email: str = Depends(verify_token)):
     """, (user_email,))
     rows = cur.fetchall()
     cur.close(); conn.close()
-
     return [
-        {
-            "id": r[0],
-            "name": r[1],
-            "location": r[2],
-            "description": r[3],
-            "price": r[4],
-            "image_url": r[5]
-        } for r in rows
+        {"id": r[0], "name": r[1], "location": r[2], "description": r[3], "price": r[4], "image_url": r[5]}
+        for r in rows
     ]
 
 @app.delete("/delete-listing/{listing_id}")
 def delete_listing(listing_id: str, user_email: str = Depends(verify_token)):
     """
-    Normal users: can delete their own listing.
-    Admin: can delete any listing by id (no owner check).
-    Returns 404 if nothing was deleted.
+    Normal users: delete their own listing.
+    Admin: can delete any listing by id.
     """
-    conn = get_db_connection()
-    cur = conn.cursor()
-
+    conn = get_db_connection(); cur = conn.cursor()
     if user_email == "admin@rentonomic.com":
         cur.execute("DELETE FROM listings WHERE id = %s", (listing_id,))
     else:
         cur.execute("DELETE FROM listings WHERE id = %s AND email = %s", (listing_id, user_email))
-
     deleted = cur.rowcount
-    conn.commit()
-    cur.close(); conn.close()
-
+    conn.commit(); cur.close(); conn.close()
     if deleted == 0:
         raise HTTPException(status_code=404, detail="Listing not found or not owned by you")
-
     return {"message": "Listing deleted"}
 
 @app.patch("/edit-listing")
@@ -290,8 +257,7 @@ def edit_listing(
     image: UploadFile = File(None),
     user_email: str = Depends(verify_token)
 ):
-    conn = get_db_connection()
-    cur = conn.cursor()
+    conn = get_db_connection(); cur = conn.cursor()
     if image:
         upload_result = cloudinary.uploader.upload(image.file)
         image_url = upload_result.get("secure_url")
@@ -310,18 +276,14 @@ def edit_listing(
     cur.close(); conn.close()
     return {"message": "Listing updated"}
 
-# ---------- Rental history (legacy) ----------
+# ========= LEGACY RENTAL REQUESTS =========
 @app.get("/rental-history")
 def rental_history_query(listing_id: str, user_email: str = Depends(verify_token)):
     return rental_history_path(listing_id, user_email)
 
 @app.get("/rental-history/{listing_id}")
 def rental_history_path(listing_id: str, user_email: str = Depends(verify_token)):
-    """
-    Return history; split rental_dates (legacy "start, end") into fields when possible.
-    """
-    conn = get_db_connection()
-    cur = conn.cursor()
+    conn = get_db_connection(); cur = conn.cursor()
     cur.execute("""
         SELECT renter_email, rental_dates, message, request_time
         FROM rental_requests
@@ -345,25 +307,19 @@ def rental_history_path(listing_id: str, user_email: str = Depends(verify_token)
             "start_date": start_date,
             "end_date": end_date,
             "message": r[2],
-            "request_time": r[3].isoformat()
+            "request_time": r[3].isoformat() if r[3] else ""
         })
     return out
 
-# ---------- Rental requests (legacy) ----------
 @app.post("/request-to-rent")
 def request_to_rent(data: RentalRequest, renter_email_from_token: str = Depends(verify_token)):
-    """
-    Legacy-compatible JSON endpoint. Ignores client-sent renter_email and uses token email.
-    """
-    conn = get_db_connection()
-    cur = conn.cursor()
-
+    conn = get_db_connection(); cur = conn.cursor()
     cur.execute("SELECT email, name FROM listings WHERE id = %s", (data.listing_id,))
     listing = cur.fetchone()
     if not listing:
         cur.close(); conn.close()
         raise HTTPException(status_code=404, detail="Listing not found")
-    owner_email, item_name = listing
+    owner_email, _item_name = listing
 
     dates_str = ""
     if data.dates and isinstance(data.dates, list) and len(data.dates) > 0:
@@ -373,13 +329,8 @@ def request_to_rent(data: RentalRequest, renter_email_from_token: str = Depends(
         INSERT INTO rental_requests (id, listing_id, renter_email, lister_email, rental_dates, message, request_time)
         VALUES (%s, %s, %s, %s, %s, %s, %s)
     """, (
-        str(uuid.uuid4()),
-        data.listing_id,
-        renter_email_from_token,
-        owner_email,
-        dates_str,
-        "Is your item available for rent on this/these days?",
-        datetime.utcnow()
+        str(uuid.uuid4()), data.listing_id, renter_email_from_token, owner_email,
+        dates_str, "Is your item available for rent on this/these days?", datetime.utcnow()
     ))
     conn.commit()
     cur.close(); conn.close()
@@ -392,18 +343,13 @@ def request_rental_form(
     end_date: str = Form(...),
     renter_email_from_token: str = Depends(verify_token)
 ):
-    """
-    FormData endpoint used by current frontend (start_date, end_date).
-    """
-    conn = get_db_connection()
-    cur = conn.cursor()
-
+    conn = get_db_connection(); cur = conn.cursor()
     cur.execute("SELECT email, name FROM listings WHERE id = %s", (listing_id,))
     listing = cur.fetchone()
     if not listing:
         cur.close(); conn.close()
         raise HTTPException(status_code=404, detail="Listing not found")
-    owner_email, item_name = listing
+    owner_email, _item_name = listing
 
     dates_str = f"{start_date}, {end_date}"
 
@@ -411,13 +357,8 @@ def request_rental_form(
         INSERT INTO rental_requests (id, listing_id, renter_email, lister_email, rental_dates, message, request_time)
         VALUES (%s, %s, %s, %s, %s, %s, %s)
     """, (
-        str(uuid.uuid4()),
-        listing_id,
-        renter_email_from_token,
-        owner_email,
-        dates_str,
-        "Is your item available for rent on this/these days?",
-        datetime.utcnow()
+        str(uuid.uuid4()), listing_id, renter_email_from_token, owner_email,
+        dates_str, "Is your item available for rent on this/these days?", datetime.utcnow()
     ))
     conn.commit()
     cur.close(); conn.close()
@@ -425,8 +366,7 @@ def request_rental_form(
 
 @app.get("/my-rental-requests")
 def get_my_rental_requests(user_email: str = Depends(verify_token)):
-    conn = get_db_connection()
-    cur = conn.cursor()
+    conn = get_db_connection(); cur = conn.cursor()
     cur.execute("""
         SELECT rr.id, rr.listing_id, l.name, rr.renter_email, rr.lister_email, rr.rental_dates, rr.message, rr.request_time
         FROM rental_requests rr
@@ -438,32 +378,25 @@ def get_my_rental_requests(user_email: str = Depends(verify_token)):
     cur.close(); conn.close()
     return [
         {
-            "id": row[0],
-            "listing_id": row[1],
-            "listing_name": row[2],
-            "renter_email": row[3],
-            "lister_email": row[4],
-            "rental_dates": row[5],
-            "message": row[6],
-            "request_time": row[7].isoformat()
-        }
-        for row in rows
+            "id": row[0], "listing_id": row[1], "listing_name": row[2],
+            "renter_email": row[3], "lister_email": row[4],
+            "rental_dates": row[5], "message": row[6],
+            "request_time": row[7].isoformat() if row[7] else ""
+        } for row in rows
     ]
 
-# ---------- Admin ----------
+# ========= ADMIN =========
 @app.get("/users")
 def get_users(admin: str = Depends(verify_admin)):
-    conn = get_db_connection()
-    cur = conn.cursor()
+    conn = get_db_connection(); cur = conn.cursor()
     cur.execute("SELECT email, signup_date FROM users")
-    users = [{"email": r[0], "signup_date": r[1], "is_verified": True} for r in cur.fetchall()]
+    rows = cur.fetchall()
     cur.close(); conn.close()
-    return users
+    return [{"email": r[0], "signup_date": r[1]} for r in rows]
 
 @app.get("/all-listings")
 def get_all(admin: str = Depends(verify_admin)):
-    conn = get_db_connection()
-    cur = conn.cursor()
+    conn = get_db_connection(); cur = conn.cursor()
     cur.execute("SELECT id, name, location, price_per_day, email FROM listings")
     rows = cur.fetchall()
     cur.close(); conn.close()
@@ -471,8 +404,7 @@ def get_all(admin: str = Depends(verify_admin)):
 
 @app.get("/rental-requests")
 def get_all_rental_requests(admin: str = Depends(verify_admin)):
-    conn = get_db_connection()
-    cur = conn.cursor()
+    conn = get_db_connection(); cur = conn.cursor()
     cur.execute("""
         SELECT rr.id, rr.listing_id, l.name, rr.renter_email, rr.lister_email, rr.rental_dates, rr.message, rr.request_time
         FROM rental_requests rr
@@ -483,22 +415,16 @@ def get_all_rental_requests(admin: str = Depends(verify_admin)):
     cur.close(); conn.close()
     return [
         {
-            "id": row[0],
-            "listing_id": row[1],
-            "listing_name": row[2],
-            "renter_email": row[3],
-            "lister_email": row[4],
-            "rental_dates": row[5],
-            "message": row[6],
-            "request_time": row[7].isoformat()
-        }
-        for row in rows
+            "id": row[0], "listing_id": row[1], "listing_name": row[2],
+            "renter_email": row[3], "lister_email": row[4],
+            "rental_dates": row[5], "message": row[6],
+            "request_time": row[7].isoformat() if row[7] else ""
+        } for row in rows
     ]
 
 @app.post("/admin/add-dummy-rental")
 def add_dummy_rental(admin: str = Depends(verify_admin)):
-    conn = get_db_connection()
-    cur = conn.cursor()
+    conn = get_db_connection(); cur = conn.cursor()
     cur.execute("SELECT id, email FROM listings LIMIT 1")
     listing = cur.fetchone()
     if not listing:
@@ -517,13 +443,8 @@ def add_dummy_rental(admin: str = Depends(verify_admin)):
         INSERT INTO rental_requests (id, listing_id, renter_email, lister_email, rental_dates, message, request_time)
         VALUES (%s, %s, %s, %s, %s, %s, %s)
     """, (
-        str(uuid.uuid4()),
-        listing_id,
-        dummy_email,
-        lister_email,
-        "2025-08-01, 2025-08-02",
-        "Is your item available for rent on this/these days?",
-        datetime.utcnow()
+        str(uuid.uuid4()), listing_id, dummy_email, lister_email,
+        "2025-08-01, 2025-08-02", "Is your item available for rent on this/these days?", datetime.utcnow()
     ))
     conn.commit()
     cur.close(); conn.close()
@@ -531,8 +452,7 @@ def add_dummy_rental(admin: str = Depends(verify_admin)):
 
 @app.delete("/admin/clear-rentals")
 def clear_rentals(admin: str = Depends(verify_admin)):
-    conn = get_db_connection()
-    cur = conn.cursor()
+    conn = get_db_connection(); cur = conn.cursor()
     cur.execute("DELETE FROM rental_requests")
     conn.commit()
     cur.close(); conn.close()
@@ -540,8 +460,7 @@ def clear_rentals(admin: str = Depends(verify_admin)):
 
 @app.get("/admin/export-users")
 def export_users(admin: str = Depends(verify_admin)):
-    conn = get_db_connection()
-    cur = conn.cursor()
+    conn = get_db_connection(); cur = conn.cursor()
     cur.execute("SELECT email, signup_date FROM users")
     rows = cur.fetchall()
     cur.close(); conn.close()
@@ -550,7 +469,8 @@ def export_users(admin: str = Depends(verify_admin)):
     writer = csv.writer(output)
     writer.writerow(["Email", "Signup Date"])
     for row in rows:
-        writer.writerow([row[0], row[1].strftime('%Y-%m-%d %H:%M:%S')])
+        dt = row[1].strftime('%Y-%m-%d %H:%M:%S') if row[1] else ""
+        writer.writerow([row[0], dt])
 
     return Response(
         content=output.getvalue(),
@@ -558,14 +478,12 @@ def export_users(admin: str = Depends(verify_admin)):
         headers={"Content-Disposition": "attachment; filename=users.csv"}
     )
 
-# --- Admin power tools (explicit endpoints) ---
+# --- Admin power tools (optional, handy) ---
 @app.delete("/admin/delete-listing/{listing_id}")
 def admin_delete_listing(listing_id: str, admin: str = Depends(verify_admin)):
     conn = get_db_connection(); cur = conn.cursor()
-    # Clean up child data first
     cur.execute("""
-        DELETE FROM messages
-        WHERE thread_id IN (
+        DELETE FROM messages WHERE thread_id IN (
             SELECT id FROM message_threads WHERE listing_id = %s
         )
     """, (listing_id,))
@@ -582,7 +500,6 @@ def admin_delete_listing(listing_id: str, admin: str = Depends(verify_admin)):
 @app.delete("/admin/delete-user/{email}")
 def admin_delete_user(email: str, admin: str = Depends(verify_admin)):
     conn = get_db_connection(); cur = conn.cursor()
-    # Messages -> Threads -> Rentals -> Legacy requests -> Listings -> User
     cur.execute("""
         DELETE FROM messages
         WHERE thread_id IN (
@@ -624,7 +541,7 @@ def admin_delete_orphans(admin: str = Depends(verify_admin)):
     conn.commit(); cur.close(); conn.close()
     return {"message": "Orphan listings deleted", "count": deleted}
 
-# ---------- Stripe: create onboarding link ----------
+# ========= STRIPE: CONNECT ONBOARDING =========
 @app.post("/stripe/create-onboarding-link")
 def stripe_create_onboarding_link(current_user: str = Depends(verify_token)):
     if not _stripe:
@@ -641,16 +558,13 @@ def stripe_create_onboarding_link(current_user: str = Depends(verify_token)):
     )
     return {"url": link["url"], "account_id": acct_id}
 
-# ============================================================
-# NEW ENDPOINTS: Checkout, Webhook, Messaging
-# ============================================================
+# ========= STRIPE: CHECKOUT + WEBHOOK =========
 @app.post("/stripe/checkout-session")
 def create_checkout_session(payload: CheckoutIn, current_user: str = Depends(verify_token)):
     if not _stripe:
         raise HTTPException(status_code=500, detail="Stripe library not installed")
-    conn = get_db_connection()
-    cur = conn.cursor()
 
+    conn = get_db_connection(); cur = conn.cursor()
     cur.execute("SELECT id, name, price_per_day, email FROM listings WHERE id = %s", (payload.listing_id,))
     row = cur.fetchone()
     if not row:
@@ -662,7 +576,6 @@ def create_checkout_session(payload: CheckoutIn, current_user: str = Depends(ver
         cur.close(); conn.close()
         raise HTTPException(status_code=400, detail="You cannot rent your own listing")
 
-    # Ensure lister has a Stripe Connect account
     cur.execute("SELECT stripe_account_id FROM users WHERE email = %s", (lister_email,))
     row2 = cur.fetchone()
     if not row2 or not row2[0]:
@@ -717,73 +630,68 @@ async def stripe_webhook(request: Request):
     payload_bytes = await request.body()
     sig_header = request.headers.get("Stripe-Signature")
 
-    # Verify when secret exists; otherwise accept (dev)
+    # Verify when secret exists; otherwise parse loosely (dev)
     if STRIPE_WEBHOOK_SECRET:
         try:
             event = _stripe.Webhook.construct_event(
-                payload=payload_bytes, sig_header=sig_header, secret=STRIPE_WEBHOOK_SECRET
+                payload_bytes.decode("utf-8"), sig_header, STRIPE_WEBHOOK_SECRET
             )
         except Exception:
             raise HTTPException(status_code=400, detail="Invalid webhook signature")
         etype = event.get("type")
         data = event.get("data", {}).get("object", {})
     else:
-        # Fallback parse without signature
         try:
-            data_raw = json.loads(payload_bytes.decode("utf-8"))
+            raw = json.loads(payload_bytes.decode("utf-8"))
         except Exception:
-            data_raw = {}
-        etype = data_raw.get("type")
-        data = data_raw.get("data", {}).get("object", {}) if isinstance(data_raw, dict) else {}
+            raw = {}
+        etype = raw.get("type")
+        data = raw.get("data", {}).get("object", {}) if isinstance(raw, dict) else {}
 
-    conn = get_db_connection()
-    cur = conn.cursor()
+    conn = get_db_connection(); cur = conn.cursor()
 
     if etype == "checkout.session.completed":
-        session_id = data.get("id")
-        payment_intent_id = data.get("payment_intent")
+        sid = data.get("id"); pi = data.get("payment_intent")
         cur.execute("""
             UPDATE rentals
             SET status='paid', stripe_payment_intent_id=%s
             WHERE stripe_session_id=%s
             RETURNING id, listing_id, renter_email, lister_email
-        """, (payment_intent_id, session_id))
-        rental = cur.fetchone()
-        if rental:
-            rid, lid, renter_email, lister_email = rental
+        """, (pi, sid))
+        row = cur.fetchone()
+        if row:
+            rid, lid, renter, lister = row
             cur.execute("""
                 INSERT INTO message_threads (rental_id, listing_id, renter_email, lister_email, is_unlocked)
                 VALUES (%s,%s,%s,%s,TRUE)
                 ON CONFLICT DO NOTHING
-            """, (rid, str(lid), renter_email, lister_email))
+            """, (rid, str(lid), renter, lister))
     elif etype in ("checkout.session.expired", "checkout.session.async_payment_failed"):
-        session_id = data.get("id")
+        sid = data.get("id")
         new_status = "expired" if etype.endswith("expired") else "canceled"
-        cur.execute("UPDATE rentals SET status=%s WHERE stripe_session_id=%s", (new_status, session_id))
+        cur.execute("UPDATE rentals SET status=%s WHERE stripe_session_id=%s", (new_status, sid))
 
-    conn.commit()
-    cur.close(); conn.close()
+    conn.commit(); cur.close(); conn.close()
     return {"received": True}
 
-# ---------- Messaging ----------
+# ========= MESSAGING =========
 @app.get("/messages/thread/{listing_id}")
 def get_thread(listing_id: str, current_user: str = Depends(verify_token)):
-    conn = get_db_connection()
-    cur = conn.cursor()
+    conn = get_db_connection(); cur = conn.cursor()
     cur.execute("""
         SELECT t.id, t.is_unlocked, t.renter_email, t.lister_email
         FROM message_threads t
-        WHERE t.listing_id = %s AND t.is_unlocked = TRUE
-          AND (t.renter_email = %s OR t.lister_email = %s)
+        WHERE t.listing_id = %s AND t.is_unlocked=TRUE
+          AND (t.renter_email=%s OR t.lister_email=%s)
         ORDER BY t.id DESC LIMIT 1
     """, (listing_id, current_user, current_user))
     thread = cur.fetchone()
 
     if not thread:
-        # If user has a rental but not paid yet, show locked message
+        # If a rental exists but not paid yet, return locked
         cur.execute("""
             SELECT status FROM rentals
-            WHERE listing_id = %s AND (renter_email = %s OR lister_email = %s)
+            WHERE listing_id=%s AND (renter_email=%s OR lister_email=%s)
             ORDER BY id DESC LIMIT 1
         """, (listing_id, current_user, current_user))
         r = cur.fetchone()
@@ -792,11 +700,11 @@ def get_thread(listing_id: str, current_user: str = Depends(verify_token)):
             raise HTTPException(status_code=403, detail="Messaging locked until payment")
         raise HTTPException(status_code=404, detail="No message thread")
 
-    thread_id, _, renter, lister = thread
+    thread_id, _unlocked, renter, lister = thread
     cur.execute("""
         SELECT id, sender_email, body, created_at
         FROM messages
-        WHERE thread_id = %s
+        WHERE thread_id=%s
         ORDER BY created_at ASC
     """, (thread_id,))
     msgs = [{"id": m[0], "sender_email": m[1], "body": m[2], "created_at": m[3].isoformat()} for m in cur.fetchall()]
@@ -805,9 +713,8 @@ def get_thread(listing_id: str, current_user: str = Depends(verify_token)):
 
 @app.post("/messages/send")
 def send_message(payload: MessageSendIn, current_user: str = Depends(verify_token)):
-    conn = get_db_connection()
-    cur = conn.cursor()
-    cur.execute("SELECT renter_email, lister_email, is_unlocked FROM message_threads WHERE id = %s", (payload.thread_id,))
+    conn = get_db_connection(); cur = conn.cursor()
+    cur.execute("SELECT renter_email, lister_email, is_unlocked FROM message_threads WHERE id=%s", (payload.thread_id,))
     row = cur.fetchone()
     if not row:
         cur.close(); conn.close()
@@ -826,9 +733,10 @@ def send_message(payload: MessageSendIn, current_user: str = Depends(verify_toke
         RETURNING id, created_at
     """, (payload.thread_id, current_user, payload.body))
     mid, created = cur.fetchone()
-    conn.commit()
-    cur.close(); conn.close()
+    conn.commit(); cur.close(); conn.close()
     return {"id": mid, "sender_email": current_user, "body": payload.body, "created_at": created.isoformat()}
+
+
 
 
 
