@@ -43,6 +43,14 @@ cloudinary.config(
     api_secret=CLOUD_API_SECRET
 )
 
+# --- SendGrid (optional) ---
+try:
+    from sendgrid import SendGridAPIClient
+    from sendgrid.helpers.mail import Mail
+except Exception:  # pragma: no cover
+    SendGridAPIClient = None
+    Mail = None
+
 # ========= APP =========
 app = FastAPI()
 app.add_middleware(
@@ -130,8 +138,83 @@ class CheckoutIn(BaseModel):
     end_date: Optional[date] = None
 
 class MessageSendIn(BaseModel):
-    thread_id: int
+    thread_id: str  # accept UUID as str
     body: str
+
+# ========= MASKING / SANITIZATION (new) =========
+import re
+
+EMAIL_RE = re.compile(r'([a-zA-Z0-9._%+-])([a-zA-Z0-9._%+-]*)(@[^@\s]+)')
+URL_RE = re.compile(r'https?://\S+|www\.\S+', re.IGNORECASE)
+PHONE_RE = re.compile(r'(\+?\s?44\s?|\(?0\)?\s?)?(\d[\s\-\(\)]?){9,12}')
+UK_POSTCODE_RE = re.compile(r'\b([A-Z]{1,2}\d{1,2}[A-Z]?)\s*\d[A-Z]{2}\b', re.IGNORECASE)
+ADDRESS_WORDS = r'(street|st|road|rd|avenue|ave|lane|ln|close|cl|drive|dr|way|court|ct|place|pl|terrace|ter|crescent|cres|house|flat|apt|apartment|block|unit)'
+ADDRESS_RE = re.compile(rf'\b\d+\s+\w+(?:\s+{ADDRESS_WORDS})\b', re.IGNORECASE)
+
+def mask_email_display(email: str) -> str:
+    try:
+        local, domain = email.split('@', 1)
+    except ValueError:
+        return '********'
+    if not local:
+        return f'****@{domain}'
+    return f'{local[0]}{"*" * max(1, len(local)-1)}@{domain}'
+
+def sanitize_message_for_unpaid(text: str) -> str:
+    t = text
+    # emails (direct)
+    t = re.sub(r'[a-zA-Z0-9._%+-]+@[^@\s]+', '[email hidden until payment]', t)
+    # obfuscated emails "john dot doe at gmail dot com"
+    t = re.sub(
+        r'\b([A-Za-z0-9._%-]+)\s*(dot|\.)\s*([A-Za-z0-9._%-]+)\s*(at|@)\s*([A-Za-z0-9._%-]+)\s*(dot|\.)\s*([A-Za-z]{2,})\b',
+        '[email hidden until payment]', t, flags=re.IGNORECASE
+    )
+    # phones
+    t = PHONE_RE.sub('[phone hidden until payment]', t)
+    # urls
+    t = URL_RE.sub('[link hidden until payment]', t)
+    # full postcodes -> outcode + note
+    def _post_to_outcode(m):
+        out = m.group(1).upper()
+        return f'{out} [full postcode hidden until payment]'
+    t = UK_POSTCODE_RE.sub(_post_to_outcode, t)
+    # addresses
+    t = ADDRESS_RE.sub('[address hidden until payment]', t)
+    return t
+
+def maybe_sanitize(text: str, is_unlocked: bool) -> str:
+    return text if is_unlocked else sanitize_message_for_unpaid(text)
+
+# ========= EMAIL NOTIFY (new; optional) =========
+def _notify_new_message(to_email: str, from_email: str, thread_id: str, preview: str, is_unlocked: bool):
+    if not (SENDGRID_API_KEY and SendGridAPIClient and Mail):
+        return
+    masked_from = mask_email_display(from_email)
+    status_line = "Messaging is unlocked for this rental." if is_unlocked else \
+                  "Phone, email, and addresses are hidden until payment."
+    body = f"""
+You have a new message from {masked_from}.
+
+Preview:
+{preview}
+
+{status_line}
+
+Sign in to view and reply:
+https://rentonomic.com/dashboard.html#thread={thread_id}
+"""
+    message = Mail(
+        from_email="admin@rentonomic.com",
+        to_emails=to_email,
+        subject="New message on Rentonomic",
+        plain_text_content=body
+    )
+    try:
+        sg = SendGridAPIClient(SENDGRID_API_KEY)
+        sg.send(message)
+    except Exception:
+        # best-effort; don't crash API on email failure
+        pass
 
 # ========= AUTH =========
 @app.post("/signup")
@@ -478,7 +561,7 @@ def export_users(admin: str = Depends(verify_admin)):
         headers={"Content-Disposition": "attachment; filename=users.csv"}
     )
 
-# --- Admin power tools (optional, handy) ---
+# --- Admin power tools ---
 @app.delete("/admin/delete-listing/{listing_id}")
 def admin_delete_listing(listing_id: str, admin: str = Depends(verify_admin)):
     conn = get_db_connection(); cur = conn.cursor()
@@ -661,11 +744,26 @@ async def stripe_webhook(request: Request):
         row = cur.fetchone()
         if row:
             rid, lid, renter, lister = row
+            # Create or unlock a thread and drop a system message
             cur.execute("""
-                INSERT INTO message_threads (rental_id, listing_id, renter_email, lister_email, is_unlocked)
-                VALUES (%s,%s,%s,%s,TRUE)
+                INSERT INTO message_threads (id, rental_id, listing_id, renter_email, lister_email, is_unlocked, created_at)
+                VALUES (%s,%s,%s,%s,%s,TRUE,NOW())
                 ON CONFLICT DO NOTHING
+            """, (str(uuid.uuid4()), rid, str(lid), renter, lister))
+            # Find the thread we just ensured/unlocked
+            cur.execute("""
+                SELECT id FROM message_threads
+                WHERE rental_id=%s AND listing_id=%s AND renter_email=%s AND lister_email=%s
+                ORDER BY created_at DESC LIMIT 1
             """, (rid, str(lid), renter, lister))
+            tr = cur.fetchone()
+            if tr:
+                thread_id = tr[0]
+                cur.execute("""
+                    INSERT INTO messages (thread_id, sender_email, body, is_system)
+                    VALUES (%s, %s, %s, TRUE)
+                """, (thread_id, 'system@rentonomic.com',
+                      "Payment confirmed — messaging with your counterparty is now unlocked."))
     elif etype in ("checkout.session.expired", "checkout.session.async_payment_failed"):
         sid = data.get("id")
         new_status = "expired" if etype.endswith("expired") else "canceled"
@@ -675,15 +773,52 @@ async def stripe_webhook(request: Request):
     return {"received": True}
 
 # ========= MESSAGING =========
+# (A) Thread list for dashboard (new)
+@app.get("/messages/threads")
+def list_threads(current_user: str = Depends(verify_token)):
+    me = current_user
+    conn = get_db_connection(); cur = conn.cursor()
+    cur.execute("""
+        SELECT t.id, t.listing_id, t.renter_email, t.lister_email, t.is_unlocked,
+               COALESCE((
+                  SELECT body FROM messages m WHERE m.thread_id = t.id
+                  ORDER BY m.created_at DESC LIMIT 1
+               ), '') AS last_body,
+               COALESCE((
+                  SELECT COUNT(*) FROM messages m
+                  WHERE m.thread_id = t.id
+                    AND m.created_at >
+                      COALESCE((SELECT last_read_at FROM message_reads r
+                                WHERE r.thread_id=t.id AND r.user_email=%s), '1970-01-01')
+               ), 0) AS unread
+        FROM message_threads t
+        WHERE t.renter_email=%s OR t.lister_email=%s
+        ORDER BY t.created_at DESC
+    """, (me, me, me))
+    rows = cur.fetchall()
+    cols = [d[0] for d in cur.description]
+    items = []
+    for r in rows:
+        item = dict(zip(cols, r))
+        item["counterparty"] = mask_email_display(
+            item["lister_email"] if me == item["renter_email"] else item["renter_email"]
+        )
+        item["last_body"] = maybe_sanitize(item["last_body"] or "", item["is_unlocked"])
+        # Don't leak raw emails in list
+        del item["renter_email"]; del item["lister_email"]
+        items.append(item)
+    cur.close(); conn.close()
+    return items
+
+# (B) Your existing thread-by-listing endpoint (enhanced with masking/sanitization on output)
 @app.get("/messages/thread/{listing_id}")
 def get_thread(listing_id: str, current_user: str = Depends(verify_token)):
     conn = get_db_connection(); cur = conn.cursor()
     cur.execute("""
         SELECT t.id, t.is_unlocked, t.renter_email, t.lister_email
         FROM message_threads t
-        WHERE t.listing_id = %s AND t.is_unlocked=TRUE
-          AND (t.renter_email=%s OR t.lister_email=%s)
-        ORDER BY t.id DESC LIMIT 1
+        WHERE t.listing_id = %s AND (t.renter_email=%s OR t.lister_email=%s)
+        ORDER BY t.created_at DESC LIMIT 1
     """, (listing_id, current_user, current_user))
     thread = cur.fetchone()
 
@@ -700,21 +835,52 @@ def get_thread(listing_id: str, current_user: str = Depends(verify_token)):
             raise HTTPException(status_code=403, detail="Messaging locked until payment")
         raise HTTPException(status_code=404, detail="No message thread")
 
-    thread_id, _unlocked, renter, lister = thread
+    thread_id, is_unlocked, renter, lister = thread
     cur.execute("""
-        SELECT id, sender_email, body, created_at
+        SELECT id, sender_email, body, created_at, COALESCE(is_system, FALSE) AS is_system
         FROM messages
         WHERE thread_id=%s
         ORDER BY created_at ASC
     """, (thread_id,))
-    msgs = [{"id": m[0], "sender_email": m[1], "body": m[2], "created_at": m[3].isoformat()} for m in cur.fetchall()]
+    msgs_raw = cur.fetchall()
+    msgs = []
+    for m in msgs_raw:
+        mid, sender_email, body, created_at, is_system = m
+        msgs.append({
+            "id": mid,
+            "sender_email": sender_email,
+            "sender_display": mask_email_display(sender_email),
+            "body": maybe_sanitize(body or "", bool(is_unlocked)),
+            "is_system": bool(is_system),
+            "created_at": created_at.isoformat() if created_at else ""
+        })
+
+    # mark read for the viewer
+    try:
+        cur.execute("""
+            INSERT INTO message_reads (thread_id, user_email, last_read_at)
+            VALUES (%s, %s, NOW())
+            ON CONFLICT (thread_id, user_email) DO UPDATE SET last_read_at=EXCLUDED.last_read_at
+        """, (thread_id, current_user))
+        conn.commit()
+    except Exception:
+        conn.rollback()
+
     cur.close(); conn.close()
-    return {"thread_id": thread_id, "renter_email": renter, "lister_email": lister, "messages": msgs}
+    return {
+        "thread_id": thread_id,
+        "is_unlocked": bool(is_unlocked),
+        "counterparty": mask_email_display(lister if current_user == renter else renter),
+        "messages": msgs
+    }
 
 @app.post("/messages/send")
 def send_message(payload: MessageSendIn, current_user: str = Depends(verify_token)):
+    # Accept both UUID strings and plain ids
+    thread_id = str(payload.thread_id)
+
     conn = get_db_connection(); cur = conn.cursor()
-    cur.execute("SELECT renter_email, lister_email, is_unlocked FROM message_threads WHERE id=%s", (payload.thread_id,))
+    cur.execute("SELECT renter_email, lister_email, is_unlocked FROM message_threads WHERE id=%s", (thread_id,))
     row = cur.fetchone()
     if not row:
         cur.close(); conn.close()
@@ -727,14 +893,53 @@ def send_message(payload: MessageSendIn, current_user: str = Depends(verify_toke
         cur.close(); conn.close()
         raise HTTPException(status_code=403, detail="Not a participant")
 
+    body = (payload.body or "").strip()
+    if not body:
+        cur.close(); conn.close()
+        raise HTTPException(status_code=400, detail="Empty message")
+
     cur.execute("""
-        INSERT INTO messages (thread_id, sender_email, body)
-        VALUES (%s, %s, %s)
+        INSERT INTO messages (thread_id, sender_email, body, is_system)
+        VALUES (%s, %s, %s, FALSE)
         RETURNING id, created_at
-    """, (payload.thread_id, current_user, payload.body))
+    """, (thread_id, current_user, body))
     mid, created = cur.fetchone()
+    conn.commit()
+
+    # Notify the other participant with a sanitized preview if still locked (it isn't, but safe)
+    other = lister if current_user == renter else renter
+    preview = maybe_sanitize(body, bool(unlocked))
+    try:
+        _notify_new_message(other, current_user, thread_id, preview, bool(unlocked))
+    except Exception:
+        pass
+
+    cur.close(); conn.close()
+    return {"id": mid, "sender_email": current_user, "body": body, "created_at": created.isoformat()}
+
+# Optional helper to mark read from UI
+@app.post("/messages/mark-read/{thread_id}")
+def mark_read(thread_id: str, current_user: str = Depends(verify_token)):
+    conn = get_db_connection(); cur = conn.cursor()
+    cur.execute("SELECT renter_email, lister_email FROM message_threads WHERE id=%s", (thread_id,))
+    row = cur.fetchone()
+    if not row:
+        cur.close(); conn.close()
+        raise HTTPException(status_code=404, detail="Thread not found")
+    renter, lister = row
+    if current_user not in (renter, lister):
+        cur.close(); conn.close()
+        raise HTTPException(status_code=403, detail="Not a participant")
+
+    cur.execute("""
+        INSERT INTO message_reads (thread_id, user_email, last_read_at)
+        VALUES (%s, %s, NOW())
+        ON CONFLICT (thread_id, user_email) DO UPDATE SET last_read_at=EXCLUDED.last_read_at
+    """, (thread_id, current_user))
     conn.commit(); cur.close(); conn.close()
-    return {"id": mid, "sender_email": current_user, "body": payload.body, "created_at": created.isoformat()}
+    return {"ok": True}
+
+
 
 
 
