@@ -9,16 +9,17 @@ import uuid
 import os
 import csv
 import json
-import requests  # kept for earlier versions (harmless)
+import requests
 from io import StringIO
 from datetime import datetime, date
 import cloudinary
 import cloudinary.uploader
 from typing import Optional, List
+import re
 
 # ========= ENV =========
 DATABASE_URL = os.environ.get("DATABASE_URL")
-SENDGRID_API_KEY = os.environ.get("SENDGRID_API_KEY")  # optional
+SENDGRID_API_KEY = os.environ.get("SENDGRID_API_KEY")
 JWT_SECRET = os.environ.get("JWT_SECRET", "secret123")
 CLOUD_NAME = os.environ.get("CLOUD_NAME")
 CLOUD_API_KEY = os.environ.get("CLOUD_API_KEY")
@@ -47,7 +48,7 @@ cloudinary.config(
 try:
     from sendgrid import SendGridAPIClient
     from sendgrid.helpers.mail import Mail
-except Exception:  # pragma: no cover
+except Exception:
     SendGridAPIClient = None
     Mail = None
 
@@ -55,7 +56,7 @@ except Exception:  # pragma: no cover
 app = FastAPI()
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],   # Netlify + Render
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -64,7 +65,6 @@ security = HTTPBearer()
 
 # ========= DB =========
 def get_db_connection():
-    # Render Postgres usually needs ?sslmode=require in the URL (already in your env)
     return psycopg2.connect(DATABASE_URL)
 
 # ========= HEALTH =========
@@ -129,8 +129,8 @@ class AuthRequest(BaseModel):
 
 class RentalRequest(BaseModel):
     listing_id: str
-    renter_email: Optional[str] = None   # ignored; we use token
-    dates: Optional[List[str]] = None    # legacy support
+    renter_email: Optional[str] = None
+    dates: Optional[List[str]] = None
 
 class CheckoutIn(BaseModel):
     listing_id: str
@@ -138,12 +138,10 @@ class CheckoutIn(BaseModel):
     end_date: Optional[date] = None
 
 class MessageSendIn(BaseModel):
-    thread_id: str  # accept UUID as str
+    thread_id: str
     body: str
 
-# ========= MASKING / SANITIZATION (new) =========
-import re
-
+# ========= MASKING / SANITIZATION =========
 EMAIL_RE = re.compile(r'([a-zA-Z0-9._%+-])([a-zA-Z0-9._%+-]*)(@[^@\s]+)')
 URL_RE = re.compile(r'https?://\S+|www\.\S+', re.IGNORECASE)
 PHONE_RE = re.compile(r'(\+?\s?44\s?|\(?0\)?\s?)?(\d[\s\-\(\)]?){9,12}')
@@ -162,30 +160,24 @@ def mask_email_display(email: str) -> str:
 
 def sanitize_message_for_unpaid(text: str) -> str:
     t = text
-    # emails (direct)
     t = re.sub(r'[a-zA-Z0-9._%+-]+@[^@\s]+', '[email hidden until payment]', t)
-    # obfuscated emails "john dot doe at gmail dot com"
     t = re.sub(
         r'\b([A-Za-z0-9._%-]+)\s*(dot|\.)\s*([A-Za-z0-9._%-]+)\s*(at|@)\s*([A-Za-z0-9._%-]+)\s*(dot|\.)\s*([A-Za-z]{2,})\b',
         '[email hidden until payment]', t, flags=re.IGNORECASE
     )
-    # phones
     t = PHONE_RE.sub('[phone hidden until payment]', t)
-    # urls
     t = URL_RE.sub('[link hidden until payment]', t)
-    # full postcodes -> outcode + note
     def _post_to_outcode(m):
         out = m.group(1).upper()
         return f'{out} [full postcode hidden until payment]'
     t = UK_POSTCODE_RE.sub(_post_to_outcode, t)
-    # addresses
     t = ADDRESS_RE.sub('[address hidden until payment]', t)
     return t
 
 def maybe_sanitize(text: str, is_unlocked: bool) -> str:
     return text if is_unlocked else sanitize_message_for_unpaid(text)
 
-# ========= EMAIL NOTIFY (new; optional) =========
+# ========= EMAIL NOTIFY =========
 def _notify_new_message(to_email: str, from_email: str, thread_id: str, preview: str, is_unlocked: bool):
     if not (SENDGRID_API_KEY and SendGridAPIClient and Mail):
         return
@@ -204,7 +196,7 @@ Sign in to view and reply:
 https://rentonomic.com/dashboard.html#thread={thread_id}
 """
     message = Mail(
-        from_email="admin@rentonomic.com",
+        from_email="alert@rentonomic.com",
         to_emails=to_email,
         subject="New message on Rentonomic",
         plain_text_content=body
@@ -213,7 +205,6 @@ https://rentonomic.com/dashboard.html#thread={thread_id}
         sg = SendGridAPIClient(SENDGRID_API_KEY)
         sg.send(message)
     except Exception:
-        # best-effort; don't crash API on email failure
         pass
 
 # ========= AUTH =========
@@ -245,7 +236,6 @@ def login(auth: AuthRequest):
     cur.close(); conn.close()
     token = jwt.encode({"email": auth.email}, JWT_SECRET, algorithm="HS256")
     return {"token": token}
-
 # ========= LISTINGS =========
 @app.post("/list")
 def list_item(
@@ -292,7 +282,7 @@ def get_listings():
             "name": r[1],
             "location": _outward_code(r[2]),
             "description": r[3],
-            "renter_price": round(float(base) * 1.10, 2),  # renter sees base×1.10
+            "renter_price": round(float(base) * 1.10, 2),
             "image_url": r[5]
         })
     return out
@@ -315,10 +305,6 @@ def my_listings(user_email: str = Depends(verify_token)):
 
 @app.delete("/delete-listing/{listing_id}")
 def delete_listing(listing_id: str, user_email: str = Depends(verify_token)):
-    """
-    Normal users: delete their own listing.
-    Admin: can delete any listing by id.
-    """
     conn = get_db_connection(); cur = conn.cursor()
     if user_email == "admin@rentonomic.com":
         cur.execute("DELETE FROM listings WHERE id = %s", (listing_id,))
@@ -359,7 +345,7 @@ def edit_listing(
     cur.close(); conn.close()
     return {"message": "Listing updated"}
 
-# ========= LEGACY RENTAL REQUESTS =========
+# ========= RENTAL HISTORY =========
 @app.get("/rental-history")
 def rental_history_query(listing_id: str, user_email: str = Depends(verify_token)):
     return rental_history_path(listing_id, user_email)
@@ -394,6 +380,7 @@ def rental_history_path(listing_id: str, user_email: str = Depends(verify_token)
         })
     return out
 
+# ========= RENTAL REQUEST =========
 @app.post("/request-to-rent")
 def request_to_rent(data: RentalRequest, renter_email_from_token: str = Depends(verify_token)):
     conn = get_db_connection(); cur = conn.cursor()
@@ -402,7 +389,7 @@ def request_to_rent(data: RentalRequest, renter_email_from_token: str = Depends(
     if not listing:
         cur.close(); conn.close()
         raise HTTPException(status_code=404, detail="Listing not found")
-    owner_email, _item_name = listing
+    owner_email, item_name = listing
 
     dates_str = ""
     if data.dates and isinstance(data.dates, list) and len(data.dates) > 0:
@@ -413,9 +400,34 @@ def request_to_rent(data: RentalRequest, renter_email_from_token: str = Depends(
         VALUES (%s, %s, %s, %s, %s, %s, %s)
     """, (
         str(uuid.uuid4()), data.listing_id, renter_email_from_token, owner_email,
-        dates_str, "Is your item available for rent on this/these days?", datetime.utcnow()
+        dates_str, "Is your item available for rent on this/these days? I want to rent.", datetime.utcnow()
     ))
     conn.commit()
+
+    # --- New email to lister ---
+    if SENDGRID_API_KEY and SendGridAPIClient and Mail:
+        masked_renter = mask_email_display(renter_email_from_token)
+        body = f"""
+{masked_renter} has requested to rent your item "{item_name}".
+
+Message:
+Is this item available for rent on these days? I want to rent.
+
+View this request in your dashboard:
+https://rentonomic.com/dashboard.html
+"""
+        try:
+            sg = SendGridAPIClient(SENDGRID_API_KEY)
+            message = Mail(
+                from_email="alert@rentonomic.com",
+                to_emails=owner_email,
+                subject=f"{masked_renter} has made a rental request",
+                plain_text_content=body
+            )
+            sg.send(message)
+        except Exception:
+            pass
+
     cur.close(); conn.close()
     return {"message": "Request sent"}
 
@@ -467,7 +479,6 @@ def get_my_rental_requests(user_email: str = Depends(verify_token)):
             "request_time": row[7].isoformat() if row[7] else ""
         } for row in rows
     ]
-
 # ========= ADMIN =========
 @app.get("/users")
 def get_users(admin: str = Depends(verify_admin)):
@@ -561,7 +572,6 @@ def export_users(admin: str = Depends(verify_admin)):
         headers={"Content-Disposition": "attachment; filename=users.csv"}
     )
 
-# --- Admin power tools ---
 @app.delete("/admin/delete-listing/{listing_id}")
 def admin_delete_listing(listing_id: str, admin: str = Depends(verify_admin)):
     conn = get_db_connection(); cur = conn.cursor()
@@ -624,7 +634,7 @@ def admin_delete_orphans(admin: str = Depends(verify_admin)):
     conn.commit(); cur.close(); conn.close()
     return {"message": "Orphan listings deleted", "count": deleted}
 
-# ========= STRIPE: CONNECT ONBOARDING =========
+# ========= STRIPE =========
 @app.post("/stripe/create-onboarding-link")
 def stripe_create_onboarding_link(current_user: str = Depends(verify_token)):
     if not _stripe:
@@ -641,7 +651,6 @@ def stripe_create_onboarding_link(current_user: str = Depends(verify_token)):
     )
     return {"url": link["url"], "account_id": acct_id}
 
-# ========= STRIPE: CHECKOUT + WEBHOOK =========
 @app.post("/stripe/checkout-session")
 def create_checkout_session(payload: CheckoutIn, current_user: str = Depends(verify_token)):
     if not _stripe:
@@ -713,7 +722,6 @@ async def stripe_webhook(request: Request):
     payload_bytes = await request.body()
     sig_header = request.headers.get("Stripe-Signature")
 
-    # Verify when secret exists; otherwise parse loosely (dev)
     if STRIPE_WEBHOOK_SECRET:
         try:
             event = _stripe.Webhook.construct_event(
@@ -724,10 +732,7 @@ async def stripe_webhook(request: Request):
         etype = event.get("type")
         data = event.get("data", {}).get("object", {})
     else:
-        try:
-            raw = json.loads(payload_bytes.decode("utf-8"))
-        except Exception:
-            raw = {}
+        raw = json.loads(payload_bytes.decode("utf-8"))
         etype = raw.get("type")
         data = raw.get("data", {}).get("object", {}) if isinstance(raw, dict) else {}
 
@@ -744,13 +749,11 @@ async def stripe_webhook(request: Request):
         row = cur.fetchone()
         if row:
             rid, lid, renter, lister = row
-            # Create or unlock a thread and drop a system message
             cur.execute("""
                 INSERT INTO message_threads (id, rental_id, listing_id, renter_email, lister_email, is_unlocked, created_at)
                 VALUES (%s,%s,%s,%s,%s,TRUE,NOW())
                 ON CONFLICT DO NOTHING
             """, (str(uuid.uuid4()), rid, str(lid), renter, lister))
-            # Find the thread we just ensured/unlocked
             cur.execute("""
                 SELECT id FROM message_threads
                 WHERE rental_id=%s AND listing_id=%s AND renter_email=%s AND lister_email=%s
@@ -773,7 +776,6 @@ async def stripe_webhook(request: Request):
     return {"received": True}
 
 # ========= MESSAGING =========
-# (A) Thread list for dashboard (new)
 @app.get("/messages/threads")
 def list_threads(current_user: str = Depends(verify_token)):
     me = current_user
@@ -783,18 +785,11 @@ def list_threads(current_user: str = Depends(verify_token)):
                COALESCE((
                   SELECT body FROM messages m WHERE m.thread_id = t.id
                   ORDER BY m.created_at DESC LIMIT 1
-               ), '') AS last_body,
-               COALESCE((
-                  SELECT COUNT(*) FROM messages m
-                  WHERE m.thread_id = t.id
-                    AND m.created_at >
-                      COALESCE((SELECT last_read_at FROM message_reads r
-                                WHERE r.thread_id=t.id AND r.user_email=%s), '1970-01-01')
-               ), 0) AS unread
+               ), '') AS last_body
         FROM message_threads t
         WHERE t.renter_email=%s OR t.lister_email=%s
         ORDER BY t.created_at DESC
-    """, (me, me, me))
+    """, (me, me))
     rows = cur.fetchall()
     cols = [d[0] for d in cur.description]
     items = []
@@ -804,13 +799,11 @@ def list_threads(current_user: str = Depends(verify_token)):
             item["lister_email"] if me == item["renter_email"] else item["renter_email"]
         )
         item["last_body"] = maybe_sanitize(item["last_body"] or "", item["is_unlocked"])
-        # Don't leak raw emails in list
         del item["renter_email"]; del item["lister_email"]
         items.append(item)
     cur.close(); conn.close()
     return items
 
-# (B) Your existing thread-by-listing endpoint (enhanced with masking/sanitization on output)
 @app.get("/messages/thread/{listing_id}")
 def get_thread(listing_id: str, current_user: str = Depends(verify_token)):
     conn = get_db_connection(); cur = conn.cursor()
@@ -823,7 +816,6 @@ def get_thread(listing_id: str, current_user: str = Depends(verify_token)):
     thread = cur.fetchone()
 
     if not thread:
-        # If a rental exists but not paid yet, return locked
         cur.execute("""
             SELECT status FROM rentals
             WHERE listing_id=%s AND (renter_email=%s OR lister_email=%s)
@@ -854,18 +846,6 @@ def get_thread(listing_id: str, current_user: str = Depends(verify_token)):
             "is_system": bool(is_system),
             "created_at": created_at.isoformat() if created_at else ""
         })
-
-    # mark read for the viewer
-    try:
-        cur.execute("""
-            INSERT INTO message_reads (thread_id, user_email, last_read_at)
-            VALUES (%s, %s, NOW())
-            ON CONFLICT (thread_id, user_email) DO UPDATE SET last_read_at=EXCLUDED.last_read_at
-        """, (thread_id, current_user))
-        conn.commit()
-    except Exception:
-        conn.rollback()
-
     cur.close(); conn.close()
     return {
         "thread_id": thread_id,
@@ -876,9 +856,7 @@ def get_thread(listing_id: str, current_user: str = Depends(verify_token)):
 
 @app.post("/messages/send")
 def send_message(payload: MessageSendIn, current_user: str = Depends(verify_token)):
-    # Accept both UUID strings and plain ids
     thread_id = str(payload.thread_id)
-
     conn = get_db_connection(); cur = conn.cursor()
     cur.execute("SELECT renter_email, lister_email, is_unlocked FROM message_threads WHERE id=%s", (thread_id,))
     row = cur.fetchone()
@@ -896,48 +874,13 @@ def send_message(payload: MessageSendIn, current_user: str = Depends(verify_toke
     body = (payload.body or "").strip()
     if not body:
         cur.close(); conn.close()
-        raise HTTPException(status_code=400, detail="Empty message")
+        raise HTTPException(status_code=400
 
-    cur.execute("""
-        INSERT INTO messages (thread_id, sender_email, body, is_system)
-        VALUES (%s, %s, %s, FALSE)
-        RETURNING id, created_at
-    """, (thread_id, current_user, body))
-    mid, created = cur.fetchone()
-    conn.commit()
 
-    # Notify the other participant with a sanitized preview if still locked (it isn't, but safe)
-    other = lister if current_user == renter else renter
-    preview = maybe_sanitize(body, bool(unlocked))
-    try:
-        _notify_new_message(other, current_user, thread_id, preview, bool(unlocked))
-    except Exception:
-        pass
 
-    cur.close(); conn.close()
-    return {"id": mid, "sender_email": current_user, "body": body, "created_at": created.isoformat()}
 
-# Optional helper to mark read from UI
-@app.post("/messages/mark-read/{thread_id}")
-def mark_read(thread_id: str, current_user: str = Depends(verify_token)):
-    conn = get_db_connection(); cur = conn.cursor()
-    cur.execute("SELECT renter_email, lister_email FROM message_threads WHERE id=%s", (thread_id,))
-    row = cur.fetchone()
-    if not row:
-        cur.close(); conn.close()
-        raise HTTPException(status_code=404, detail="Thread not found")
-    renter, lister = row
-    if current_user not in (renter, lister):
-        cur.close(); conn.close()
-        raise HTTPException(status_code=403, detail="Not a participant")
 
-    cur.execute("""
-        INSERT INTO message_reads (thread_id, user_email, last_read_at)
-        VALUES (%s, %s, NOW())
-        ON CONFLICT (thread_id, user_email) DO UPDATE SET last_read_at=EXCLUDED.last_read_at
-    """, (thread_id, current_user))
-    conn.commit(); cur.close(); conn.close()
-    return {"ok": True}
+
 
 
 
