@@ -853,7 +853,6 @@ def get_thread(listing_id: str, current_user: str = Depends(verify_token)):
         "counterparty": mask_email_display(lister if current_user == renter else renter),
         "messages": msgs
     }
-
 @app.post("/messages/send")
 def send_message(payload: MessageSendIn, current_user: str = Depends(verify_token)):
     thread_id = str(payload.thread_id)
@@ -874,7 +873,19 @@ def send_message(payload: MessageSendIn, current_user: str = Depends(verify_toke
     body = (payload.body or "").strip()
     if not body:
         cur.close(); conn.close()
-        raise HTTPException(status_code=400
+        raise HTTPException(status_code=400, detail="Message body is required")  # <-- closed
+
+    # (Optional) basic masking pre-payment could happen here if you want extra safety.
+    # Insert message
+    cur.execute(
+        "INSERT INTO messages (thread_id, sender_email, body) VALUES (%s, %s, %s)",
+        (thread_id, current_user, body),
+    )
+    conn.commit()
+    cur.close(); conn.close()
+    return {"ok": True}
+
+
 
 
 
