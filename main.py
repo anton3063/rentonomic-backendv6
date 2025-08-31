@@ -11,9 +11,9 @@
 #                   onboarding link, webhook → mark paid, unlock thread, insert rentals, email both parties
 # - Emails: SendGrid best-effort; never break requests on email failure
 # - Outward postcode rule (store prefix only)
-# - CORS configured for Netlify + production domain
+# - CORS configured for production domain (+ localhost for dev)
 # - Auto-creates aux tables if missing: stripe_accounts, rentals
-# - **Startup guard removes any legacy `DELETE /delete-listing/{listing_id}` route**
+# - Startup guard removes any legacy `DELETE /delete-listing/{listing_id}` route
 # ------------------------------------------------------------
 
 import os
@@ -63,16 +63,18 @@ PLATFORM_FEE_RATE = 0.10  # 10%
 
 app = FastAPI(title="Rentonomic API")
 
+# ---------------------- CORS (production-safe) ----------------------
+# IMPORTANT: When allow_credentials=True, do NOT use "*".
+ALLOWED_ORIGINS = [
+    "https://rentonomic.com",
+    "https://www.rentonomic.com",
+    # Dev convenience (remove in prod if you prefer):
+    "http://localhost",
+    "http://localhost:5173",
+]
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[
-        "https://rentonomic.com",
-        "https://www.rentonomic.com",
-        "https://rentonomic.netlify.app",
-        "http://localhost",
-        "http://localhost:5173",
-        "*",  # keep broad during iteration; lock down later
-    ],
+    allow_origins=ALLOWED_ORIGINS,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -83,6 +85,7 @@ app.add_middleware(
 def get_db_connection():
     if not DATABASE_URL:
         raise RuntimeError("DATABASE_URL not set")
+    # Render Postgres requires SSL
     return psycopg2.connect(DATABASE_URL, sslmode="require")
 
 def fetch_all_dict(cur) -> List[Dict[str, Any]]:
@@ -127,8 +130,11 @@ def ensure_aux_tables():
         """)
         conn.commit()
     finally:
-        try: cur.close(); conn.close()
-        except Exception: pass
+        try:
+            cur.close()
+            conn.close()
+        except Exception:
+            pass
 
 def _prune_legacy_delete_route():
     """
@@ -206,7 +212,67 @@ def send_alert_email(to_email: str, subject: str, html: str) -> None:
         )
         sg.send(msg)
     except Exception:
-        pass  # never fail the API on email issues
+        # never fail the API on email issues
+        pass
+
+# ---------------------- Stripe helpers ----------------------
+
+def stripe_ready() -> bool:
+    return bool(stripe_sdk and STRIPE_SECRET_KEY)
+
+def stripe_set_key():
+    if stripe_ready():
+        stripe_sdk.api_key = STRIPE_SECRET_KEY
+
+def get_connect_account_id(email: str) -> Optional[str]:
+    conn = get_db_connection(); cur = conn.cursor()
+    try:
+        cur.execute("SELECT account_id FROM stripe_accounts WHERE email=%s", (email,))
+        row = cur.fetchone()
+        return row[0] if row else None
+    finally:
+        cur.close(); conn.close()
+
+def set_connect_account_id(email: str, account_id: str) -> None:
+    conn = get_db_connection(); cur = conn.cursor()
+    try:
+        cur.execute("""
+            INSERT INTO stripe_accounts (email, account_id)
+            VALUES (%s, %s)
+            ON CONFLICT (email) DO UPDATE SET account_id=EXCLUDED.account_id
+        """, (email, account_id))
+        conn.commit()
+    finally:
+        cur.close(); conn.close()
+
+def require_lister_ready_for_payments(lister_email: str) -> Optional[str]:
+    """
+    Returns None if ready; returns onboarding URL if not ready.
+    """
+    if not stripe_ready():
+        return None  # don't block when Stripe not configured
+    stripe_set_key()
+    acct_id = get_connect_account_id(lister_email)
+    if not acct_id:
+        acct = stripe_sdk.Account.create(type="express", email=lister_email)
+        set_connect_account_id(lister_email, acct.id)
+        link = stripe_sdk.AccountLink.create(
+            account=acct.id,
+            refresh_url=f"{FRONTEND_BASE}/dashboard.html?onboarding=refresh",
+            return_url=f"{FRONTEND_BASE}/dashboard.html?onboarding=return",
+            type="account_onboarding",
+        )
+        return link.url
+    acct = stripe_sdk.Account.retrieve(acct_id)
+    if not (acct.get("charges_enabled") and acct.get("details_submitted")):
+        link = stripe_sdk.AccountLink.create(
+            account=acct_id,
+            refresh_url=f"{FRONTEND_BASE}/dashboard.html?onboarding=refresh",
+            return_url=f"{FRONTEND_BASE}/dashboard.html?onboarding=return",
+            type="account_onboarding",
+        )
+        return link.url
+    return None
 
 # ---------------------- Models ----------------------
 
@@ -360,8 +426,10 @@ def update_listing(
         if description is not None: fields.append("description=%s"); values.append(description)
         if location is not None: fields.append("location=%s"); values.append(outward_prefix(location))
         if price_per_day is not None:
-            try: price_num = float(str(price_per_day).replace(",", ""))
-            except Exception: raise HTTPException(status_code=400, detail="Invalid price")
+            try:
+                price_num = float(str(price_per_day).replace(",", ""))
+            except Exception:
+                raise HTTPException(status_code=400, detail="Invalid price")
             fields.append("price_per_day=%s"); values.append(price_num)
         if image_url is not None: fields.append("image_url=%s"); values.append(image_url)
         if not fields:
@@ -540,65 +608,6 @@ def my_rental_requests(
     finally:
         cur.close(); conn.close()
 
-# ---------------------- Stripe Connect helpers ----------------------
-
-def stripe_ready() -> bool:
-    return bool(stripe_sdk and STRIPE_SECRET_KEY)
-
-def stripe_set_key():
-    if stripe_ready():
-        stripe_sdk.api_key = STRIPE_SECRET_KEY
-
-def get_connect_account_id(email: str) -> Optional[str]:
-    conn = get_db_connection(); cur = conn.cursor()
-    try:
-        cur.execute("SELECT account_id FROM stripe_accounts WHERE email=%s", (email,))
-        row = cur.fetchone()
-        return row[0] if row else None
-    finally:
-        cur.close(); conn.close()
-
-def set_connect_account_id(email: str, account_id: str) -> None:
-    conn = get_db_connection(); cur = conn.cursor()
-    try:
-        cur.execute("""
-            INSERT INTO stripe_accounts (email, account_id)
-            VALUES (%s, %s)
-            ON CONFLICT (email) DO UPDATE SET account_id=EXCLUDED.account_id
-        """, (email, account_id))
-        conn.commit()
-    finally:
-        cur.close(); conn.close()
-
-def require_lister_ready_for_payments(lister_email: str) -> Optional[str]:
-    """
-    Returns None if ready; returns onboarding URL if not ready.
-    """
-    if not stripe_ready():
-        return None  # don't block when Stripe not configured
-    stripe_set_key()
-    acct_id = get_connect_account_id(lister_email)
-    if not acct_id:
-        acct = stripe_sdk.Account.create(type="express", email=lister_email)
-        set_connect_account_id(lister_email, acct.id)
-        link = stripe_sdk.AccountLink.create(
-            account=acct.id,
-            refresh_url=f"{FRONTEND_BASE}/dashboard.html?onboarding=refresh",
-            return_url=f"{FRONTEND_BASE}/dashboard.html?onboarding=return",
-            type="account_onboarding",
-        )
-        return link.url
-    acct = stripe_sdk.Account.retrieve(acct_id)
-    if not (acct.get("charges_enabled") and acct.get("details_submitted")):
-        link = stripe_sdk.AccountLink.create(
-            account=acct_id,
-            refresh_url=f"{FRONTEND_BASE}/dashboard.html?onboarding=refresh",
-            return_url=f"{FRONTEND_BASE}/dashboard.html?onboarding=return",
-            type="account_onboarding",
-        )
-        return link.url
-    return None
-
 # ---------------------- Accept / Decline ----------------------
 
 @app.post("/rental-requests/{request_id}/accept")
@@ -775,13 +784,6 @@ def admin_all_rental_requests(
 
 # ---------------------- Stripe ----------------------
 
-def stripe_ready() -> bool:
-    return bool(stripe_sdk and STRIPE_SECRET_KEY)
-
-def stripe_set_key():
-    if stripe_ready():
-        stripe_sdk.api_key = STRIPE_SECRET_KEY
-
 @app.post("/stripe/create-onboarding-link")
 def stripe_onboard(current_user: str = Depends(verify_token)):
     if not stripe_ready():
@@ -946,8 +948,11 @@ async def stripe_webhook(request: Request):
                 """, (base_total_p, final_total_p, fee_p, str(req_id)))
                 conn.commit()
             finally:
-                try: cur.close(); conn.close()
-                except Exception: pass
+                try:
+                    cur.close()
+                    conn.close()
+                except Exception:
+                    pass
 
             # Email both parties (best-effort)
             try:
@@ -971,6 +976,8 @@ async def stripe_webhook(request: Request):
 @app.get("/")
 def root():
     return {"ok": True, "service": "rentonomic-api"}
+
+
 
 
 
