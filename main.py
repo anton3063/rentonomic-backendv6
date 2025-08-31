@@ -1,4 +1,4 @@
-# main.py — Rentonomic (FastAPI) — full production build
+# main.py — Rentonomic (FastAPI) — full production build with legacy-route pruning
 # ------------------------------------------------------------
 # Major features:
 # - Auth (signup/login) with JWT
@@ -13,9 +13,7 @@
 # - Outward postcode rule (store prefix only)
 # - CORS configured for Netlify + production domain
 # - Auto-creates aux tables if missing: stripe_accounts, rentals
-# NOTE: There is NO legacy delete handler named `delete_listing`. The only delete endpoints are:
-#       - DELETE /admin/listings/{listing_id}            (manual cascade)
-#       - DELETE /delete-listing/{listing_id}            (calls the admin delete)
+# - **Startup guard removes any legacy `DELETE /delete-listing/{listing_id}` route**
 # ------------------------------------------------------------
 
 import os
@@ -132,9 +130,27 @@ def ensure_aux_tables():
         try: cur.close(); conn.close()
         except Exception: pass
 
+def _prune_legacy_delete_route():
+    """
+    Remove any older DELETE /delete-listing/{listing_id} route not backed by our fallback/admin functions.
+    This prevents shadowing by stale handlers named `delete_listing`.
+    """
+    new_routes = []
+    for r in app.router.routes:
+        path = getattr(r, "path", None)
+        methods = set(getattr(r, "methods", []) or [])
+        ep = getattr(r, "endpoint", None)
+        epname = getattr(ep, "__name__", "") if ep else ""
+        if path == "/delete-listing/{listing_id}" and "DELETE" in methods and epname not in {"delete_listing_fallback", "admin_delete_listing"}:
+            # drop the legacy route
+            continue
+        new_routes.append(r)
+    app.router.routes = new_routes
+
 @app.on_event("startup")
 def _startup():
     ensure_aux_tables()
+    _prune_legacy_delete_route()
 
 # ---------------------- Auth helpers ----------------------
 
@@ -955,6 +971,8 @@ async def stripe_webhook(request: Request):
 @app.get("/")
 def root():
     return {"ok": True, "service": "rentonomic-api"}
+
+
 
 
 
