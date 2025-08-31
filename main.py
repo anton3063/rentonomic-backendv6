@@ -1,17 +1,16 @@
-# main.py — Rentonomic (FastAPI) — full production build with legacy-route pruning
+# main.py — Rentonomic (FastAPI) — production build with legacy-route pruning
 # ------------------------------------------------------------
 # Major features:
-# - Auth (signup/login) with JWT
+# - Auth (signup/login) with JWT (backwards-compatible with legacy users table)
 # - Listings: public list/get, create (owner), update (owner), my-listings
-#             Admin: soft-delete/restore, hard-delete (manual cascade)
+#             Admin: soft-delete/restore, hard-delete (manual cascade), list-all
 # - Rental requests: create (JSON), list mine (renter/lister/all), accept/decline
 # - Messaging: threads/messages; server-side PII guard while locked; unlock on payment
 # - Admin: site-wide rental requests (limit/offset), listing moderation
 # - Stripe Connect: persist lister account, enforce onboarding, destination charge, fee (10%)
-#                   onboarding link, webhook → mark paid, unlock thread, insert rentals, email both parties
 # - Emails: SendGrid best-effort; never break requests on email failure
 # - Outward postcode rule (store prefix only)
-# - CORS configured for production domain (+ localhost for dev)
+# - CORS configured for production domain (+ localhost dev)
 # - Auto-creates aux tables if missing: stripe_accounts, rentals
 # - Startup guard removes any legacy `DELETE /delete-listing/{listing_id}` route
 # ------------------------------------------------------------
@@ -51,7 +50,7 @@ DATABASE_URL = os.environ.get("DATABASE_URL", "")
 JWT_SECRET = os.environ.get("JWT_SECRET", "change-me")
 JWT_ALG = "HS256"
 
-ADMIN_EMAILS = {"admin@rentonomic.com"}  # golden-rule admin
+ADMIN_EMAILS = {"admin@rentonomic.com"}  # update as needed
 ALERT_FROM_EMAIL = os.environ.get("ALERT_FROM_EMAIL", "alert@rentonomic.com")
 SENDGRID_API_KEY = os.environ.get("SENDGRID_API_KEY", "")
 
@@ -64,11 +63,11 @@ PLATFORM_FEE_RATE = 0.10  # 10%
 app = FastAPI(title="Rentonomic API")
 
 # ---------------------- CORS (production-safe) ----------------------
-# IMPORTANT: When allow_credentials=True, do NOT use "*".
+# IMPORTANT: When allow_credentials=True, you must not use "*" for origins.
 ALLOWED_ORIGINS = [
     "https://rentonomic.com",
     "https://www.rentonomic.com",
-    # Dev convenience (remove in prod if you prefer):
+    "https://rentonomic.netlify.app",  # if you still use it anywhere
     "http://localhost",
     "http://localhost:5173",
 ]
@@ -327,13 +326,60 @@ def signup(payload: SignupIn):
 
 @app.post("/login")
 def login(payload: LoginIn):
+    """
+    Backwards-compatible login:
+    - prefers bcrypt in users.password_hash
+    - falls back to users.password (bcrypt or plaintext)
+    - if plaintext matches, migrate to bcrypt immediately
+    """
     email = payload.email.lower()
     conn = get_db_connection(); cur = conn.cursor()
     try:
-        cur.execute("SELECT password_hash FROM users WHERE email=%s", (email,))
+        try:
+            cur.execute("SELECT password_hash, password FROM users WHERE email=%s", (email,))
+        except Exception:
+            cur.execute("SELECT password FROM users WHERE email=%s", (email,))
         row = cur.fetchone()
-        if not row or not verify_password(payload.password, row[0]):
+        if not row:
             raise HTTPException(status_code=401, detail="Invalid credentials")
+
+        pwd_hash = row[0] if len(row) > 0 else None
+        legacy = row[1] if len(row) > 1 else None
+
+        candidate = payload.password
+        ok = False
+
+        # preferred hash
+        if pwd_hash:
+            try:
+                ok = bcrypt.checkpw(candidate.encode(), str(pwd_hash).encode())
+            except Exception:
+                ok = False
+
+        # legacy fallback
+        if not ok and legacy is not None:
+            legacy = str(legacy)
+            if legacy.startswith("$2"):  # bcrypt marker
+                try:
+                    ok = bcrypt.checkpw(candidate.encode(), legacy.encode())
+                except Exception:
+                    ok = False
+            else:
+                ok = (legacy == candidate)
+                if ok:
+                    # migrate on the spot
+                    try:
+                        cur.execute(
+                            "UPDATE users SET password_hash=%s, password=NULL WHERE email=%s",
+                            (hash_password(candidate), email),
+                        )
+                        conn.commit()
+                    except Exception:
+                        conn.rollback()
+
+        if not ok:
+            raise HTTPException(status_code=401, detail="Invalid credentials")
+
         token = create_access_token(email)
         return {"token": token, "email": email}
     finally:
@@ -355,6 +401,11 @@ def get_listings():
         return fetch_all_dict(cur)
     finally:
         cur.close(); conn.close()
+
+# Public alias some dashboards still call
+@app.get("/all-listings")
+def get_all_listings_alias():
+    return get_listings()
 
 @app.get("/listing/{listing_id}")
 def get_listing(listing_id: Union[int, str]):
@@ -746,7 +797,6 @@ def send_message(payload: MessageSendIn, current_user: str = Depends(verify_toke
         if not unlocked:
             if contains_pii(body):
                 raise HTTPException(status_code=403, detail="PII (email/phone/URL) not allowed before payment")
-            # allow non-PII prepayment messages through
 
         cur.execute("""
             INSERT INTO messages (thread_id, sender_email, body, created_at, system)
@@ -769,7 +819,7 @@ def admin_all_rental_requests(
         raise HTTPException(status_code=403, detail="Admin only")
     conn = get_db_connection(); cur = conn.cursor()
     try:
-        cur.execute(f"""
+        cur.execute("""
             SELECT rr.id, rr.listing_id, COALESCE(l.name,'') AS listing_name,
                    rr.renter_email, rr.lister_email, rr.start_date, rr.end_date,
                    COALESCE(rr.status,'') AS status, COALESCE(rr.request_time,NOW()) AS request_time
@@ -781,6 +831,68 @@ def admin_all_rental_requests(
         return fetch_all_dict(cur)
     finally:
         cur.close(); conn.close()
+
+# Admin: list all listings (optionally include deleted)
+@app.get("/admin/listings")
+def admin_listings(
+    include_deleted: bool = Query(False),
+    limit: int = Query(200, ge=1, le=1000),
+    offset: int = Query(0, ge=0),
+    current_user: str = Depends(verify_token),
+):
+    if not is_admin(current_user):
+        raise HTTPException(status_code=403, detail="Admin only")
+    conn = get_db_connection(); cur = conn.cursor()
+    try:
+        if include_deleted:
+            cur.execute("""
+                SELECT id, name, description, location, image_url, price_per_day,
+                       owner_email, created_at, deleted_at
+                FROM listings
+                ORDER BY created_at DESC
+                LIMIT %s OFFSET %s
+            """, (limit, offset))
+        else:
+            cur.execute("""
+                SELECT id, name, description, location, image_url, price_per_day,
+                       owner_email, created_at, deleted_at
+                FROM listings
+                WHERE deleted_at IS NULL
+                ORDER BY created_at DESC
+                LIMIT %s OFFSET %s
+            """, (limit, offset))
+        return fetch_all_dict(cur)
+    finally:
+        cur.close(); conn.close()
+
+# Compatibility alias some frontends call:
+@app.get("/rental-requests")
+def rental_requests_alias(
+    role: Optional[str] = Query(None),
+    limit: Optional[int] = Query(None),
+    offset: Optional[int] = Query(None),
+    current_user: str = Depends(verify_token),
+):
+    if is_admin(current_user):
+        # Admin view when called without params
+        lim = limit if isinstance(limit, int) and 1 <= limit <= 1000 else 200
+        off = offset if isinstance(offset, int) and offset >= 0 else 0
+        conn = get_db_connection(); cur = conn.cursor()
+        try:
+            cur.execute("""
+                SELECT rr.id, rr.listing_id, COALESCE(l.name,'') AS listing_name,
+                       rr.renter_email, rr.lister_email, rr.start_date, rr.end_date,
+                       COALESCE(rr.status,'') AS status, COALESCE(rr.request_time,NOW()) AS request_time
+                FROM rental_requests rr
+                LEFT JOIN listings l ON l.id = rr.listing_id
+                ORDER BY rr.request_time DESC
+                LIMIT %s OFFSET %s
+            """, (lim, off))
+            return fetch_all_dict(cur)
+        finally:
+            cur.close(); conn.close()
+    # Non-admin → reuse my_rental_requests behaviour
+    return my_rental_requests(role=role, current_user=current_user)
 
 # ---------------------- Stripe ----------------------
 
@@ -976,6 +1088,8 @@ async def stripe_webhook(request: Request):
 @app.get("/")
 def root():
     return {"ok": True, "service": "rentonomic-api"}
+
+
 
 
 
