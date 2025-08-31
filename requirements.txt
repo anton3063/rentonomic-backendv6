@@ -1,20 +1,21 @@
-fastapi==0.115.2
-uvicorn[standard]==0.30.6
-psycopg2-binary==2.9.9
-python-multipart==0.0.9
-bcrypt==4.2.0
-PyJWT==2.9.0
+# Core API
+fastapi
+uvicorn[standard]
+psycopg2-binary
+python-multipart
+bcrypt
+PyJWT
+requests
 
-# Pydantic v2 email validation (installs email-validator for you)
-pydantic[email]==2.9.2
+# Validation (EmailStr needs this)
+pydantic[email]
+email-validator
 
-# Optional/used in code
-sendgrid==6.11.0
-stripe==10.8.0
+# Integrations you already use
+sendgrid
+stripe
+cloudinary
 
-# If you actually use these elsewhere, keep them — otherwise remove:
-requests==2.32.3
-cloudinary==1.41.0
 
 
 
@@ -31,6 +32,7 @@ cloudinary==1.41.0
 
 
               
+
 
 
 
