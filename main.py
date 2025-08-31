@@ -13,6 +13,9 @@
 # - Outward postcode rule (store prefix only)
 # - CORS configured for Netlify + production domain
 # - Auto-creates aux tables if missing: stripe_accounts, rentals
+# NOTE: There is NO legacy delete handler named `delete_listing`. The only delete endpoints are:
+#       - DELETE /admin/listings/{listing_id}            (manual cascade)
+#       - DELETE /delete-listing/{listing_id}            (calls the admin delete)
 # ------------------------------------------------------------
 
 import os
@@ -430,6 +433,7 @@ def admin_delete_listing(listing_id: Union[int, str], current_user: str = Depend
 
 @app.delete("/delete-listing/{listing_id}")
 def delete_listing_fallback(listing_id: Union[int, str], current_user: str = Depends(verify_token)):
+    # Keep admin-only for safety; this simply delegates to admin delete
     if not is_admin(current_user):
         raise HTTPException(status_code=403, detail="Admin only")
     return admin_delete_listing(listing_id, current_user)
@@ -717,8 +721,8 @@ def send_message(payload: MessageSendIn, current_user: str = Depends(verify_toke
         if not unlocked:
             if contains_pii(body):
                 raise HTTPException(status_code=403, detail="PII (email/phone/URL) not allowed before payment")
-            # else allow non-PII prepayment messages if you want:
-            # return {"ok": False, "message": "Messaging locked"}  # stricter variant
+            # allow non-PII prepayment messages through
+
         cur.execute("""
             INSERT INTO messages (thread_id, sender_email, body, created_at, system)
             VALUES (%s, %s, %s, NOW(), FALSE)
@@ -754,6 +758,13 @@ def admin_all_rental_requests(
         cur.close(); conn.close()
 
 # ---------------------- Stripe ----------------------
+
+def stripe_ready() -> bool:
+    return bool(stripe_sdk and STRIPE_SECRET_KEY)
+
+def stripe_set_key():
+    if stripe_ready():
+        stripe_sdk.api_key = STRIPE_SECRET_KEY
 
 @app.post("/stripe/create-onboarding-link")
 def stripe_onboard(current_user: str = Depends(verify_token)):
@@ -813,7 +824,6 @@ def stripe_checkout_start(payload: CheckoutStartIn, current_user: str = Depends(
         # Destination charge to lister's connected account
         lister_acct = get_connect_account_id(r["lister_email"])
         if not lister_acct:
-            # should not happen because require_lister_ready_for_payments already created it
             onboarding_url = require_lister_ready_for_payments(r["lister_email"])
             raise HTTPException(status_code=409, detail={"onboarding_url": onboarding_url or "Connect account missing"})
 
@@ -945,6 +955,7 @@ async def stripe_webhook(request: Request):
 @app.get("/")
 def root():
     return {"ok": True, "service": "rentonomic-api"}
+
 
 
 
