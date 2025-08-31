@@ -1,28 +1,25 @@
-# main.py — Rentonomic (FastAPI) — production build with legacy-route pruning
-# ------------------------------------------------------------
-# Major features:
-# - Auth (signup/login) with JWT (backwards-compatible with legacy users table)
-# - Listings: public list/get, create (owner), update (owner), my-listings
-#             Admin: soft-delete/restore, hard-delete (manual cascade), list-all
-# - Rental requests: create (JSON), list mine (renter/lister/all), accept/decline
-# - Messaging: threads/messages; server-side PII guard while locked; unlock on payment
-# - Admin: site-wide rental requests (limit/offset), listing moderation
-# - Stripe Connect: persist lister account, enforce onboarding, destination charge, fee (10%)
-# - Emails: SendGrid best-effort; never break requests on email failure
-# - Outward postcode rule (store prefix only)
-# - CORS configured for production domain (+ localhost dev)
-# - Auto-creates aux tables if missing: stripe_accounts, rentals
-# - Startup guard removes any legacy `DELETE /delete-listing/{listing_id}` route
-# ------------------------------------------------------------
+# main.py — Rentonomic (FastAPI) — production build with compat endpoints & auto-migrations
+# ----------------------------------------------------------------------------------------
+# Features
+# - Auth (JWT)
+# - Listings: public list/get, create, update, my-listings
+# - Admin moderation: soft-delete, restore, hard-delete + GET /admin/listings (new)
+# - Rental requests: create, my-rental-requests (renter/lister/all)
+# - Compat alias: GET /rental-requests (maps to my/all depending on role/admin)
+# - Accept/Decline; Stripe Connect checkout + webhook unlocks chat, records rentals
+# - Messaging threads/messages with server PII guard pre-payment
+# - Email via SendGrid (best-effort)
+# - Outward postcode rule enforced server-side
+# - CORS for production + localhost
+# - Startup auto-migrations: ensure columns/indexes, backfill owner_email
+# - Startup guard to prune any legacy /delete-listing route
+# ----------------------------------------------------------------------------------------
 
-import os
-import re
+import os, re
 from typing import Optional, Union, Dict, Any, List
 from datetime import datetime, timedelta, date
 
-from fastapi import (
-    FastAPI, Depends, HTTPException, Body, Form, Request, Header, Query
-)
+from fastapi import FastAPI, Depends, HTTPException, Body, Form, Request, Header, Query
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, EmailStr
 import bcrypt
@@ -34,14 +31,14 @@ import psycopg2.extras
 try:
     from sendgrid import SendGridAPIClient
     from sendgrid.helpers.mail import Mail
-except Exception:  # pragma: no cover
+except Exception:
     SendGridAPIClient = None
     Mail = None
 
 # Stripe (optional)
 try:
     import stripe as stripe_sdk
-except Exception:  # pragma: no cover
+except Exception:
     stripe_sdk = None
 
 # ---------------------- Config ----------------------
@@ -50,7 +47,7 @@ DATABASE_URL = os.environ.get("DATABASE_URL", "")
 JWT_SECRET = os.environ.get("JWT_SECRET", "change-me")
 JWT_ALG = "HS256"
 
-ADMIN_EMAILS = {"admin@rentonomic.com"}  # update as needed
+ADMIN_EMAILS = {"admin@rentonomic.com"}  # set your admin(s)
 ALERT_FROM_EMAIL = os.environ.get("ALERT_FROM_EMAIL", "alert@rentonomic.com")
 SENDGRID_API_KEY = os.environ.get("SENDGRID_API_KEY", "")
 
@@ -62,12 +59,11 @@ PLATFORM_FEE_RATE = 0.10  # 10%
 
 app = FastAPI(title="Rentonomic API")
 
-# ---------------------- CORS (production-safe) ----------------------
-# IMPORTANT: When allow_credentials=True, you must not use "*" for origins.
+# ---------------------- CORS ----------------------
 ALLOWED_ORIGINS = [
     "https://rentonomic.com",
     "https://www.rentonomic.com",
-    "https://rentonomic.netlify.app",  # if you still use it anywhere
+    "https://rentonomic.netlify.app",
     "http://localhost",
     "http://localhost:5173",
 ]
@@ -84,7 +80,6 @@ app.add_middleware(
 def get_db_connection():
     if not DATABASE_URL:
         raise RuntimeError("DATABASE_URL not set")
-    # Render Postgres requires SSL
     return psycopg2.connect(DATABASE_URL, sslmode="require")
 
 def fetch_all_dict(cur) -> List[Dict[str, Any]]:
@@ -101,10 +96,10 @@ def fetch_one_dict(cur) -> Optional[Dict[str, Any]]:
     return {desc.name: val for desc, val in zip(cur.description, r)}
 
 def ensure_aux_tables():
-    """Create auxiliary tables if they don't exist."""
-    conn = get_db_connection()
-    cur = conn.cursor()
+    """Create auxiliary tables if they don't exist (safe/idempotent)."""
+    conn = get_db_connection(); cur = conn.cursor()
     try:
+        # Stripe accounts registry
         cur.execute("""
             CREATE TABLE IF NOT EXISTS stripe_accounts (
                 email TEXT PRIMARY KEY,
@@ -112,6 +107,7 @@ def ensure_aux_tables():
                 created_at TIMESTAMP NOT NULL DEFAULT NOW()
             )
         """)
+        # Rentals summary (inserted at webhook)
         cur.execute("""
             CREATE TABLE IF NOT EXISTS rentals (
                 id SERIAL PRIMARY KEY,
@@ -127,19 +123,63 @@ def ensure_aux_tables():
                 created_at TIMESTAMP NOT NULL DEFAULT NOW()
             )
         """)
+        # Make sure messages has 'system' flag
+        cur.execute("ALTER TABLE messages ADD COLUMN IF NOT EXISTS system BOOLEAN DEFAULT FALSE")
+        # Helpful indexes
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_rentals_listing ON rentals(listing_id)")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_messages_thread ON messages(thread_id)")
         conn.commit()
     finally:
-        try:
-            cur.close()
-            conn.close()
-        except Exception:
-            pass
+        try: cur.close(); conn.close()
+        except Exception: pass
+
+def ensure_core_columns_and_indexes():
+    """
+    Keep core tables aligned with code. Adds columns if missing and creates indexes.
+    Also backfills owner_email for legacy data so /my-listings works immediately.
+    """
+    conn = get_db_connection(); cur = conn.cursor()
+    try:
+        # listings columns & backfill
+        cur.execute("ALTER TABLE listings ADD COLUMN IF NOT EXISTS owner_email TEXT")
+        cur.execute("ALTER TABLE listings ADD COLUMN IF NOT EXISTS created_at TIMESTAMP DEFAULT NOW()")
+        cur.execute("ALTER TABLE listings ADD COLUMN IF NOT EXISTS deleted_at TIMESTAMP NULL")
+        cur.execute("""
+            UPDATE listings
+               SET owner_email = COALESCE(owner_email, email, user_email)
+             WHERE owner_email IS NULL
+        """)
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_listings_owner_email ON listings(owner_email)")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_listings_deleted ON listings(deleted_at)")
+
+        # rental_requests columns
+        cur.execute("ALTER TABLE rental_requests ADD COLUMN IF NOT EXISTS status TEXT DEFAULT 'requested'")
+        cur.execute("ALTER TABLE rental_requests ADD COLUMN IF NOT EXISTS request_time TIMESTAMP DEFAULT NOW()")
+        cur.execute("ALTER TABLE rental_requests ADD COLUMN IF NOT EXISTS updated_at TIMESTAMP NULL")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_rr_lister ON rental_requests(lister_email)")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_rr_renter ON rental_requests(renter_email)")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_rr_listing ON rental_requests(listing_id)")
+
+        # message_threads columns + unique index for (listing_id,renter,lister)
+        cur.execute("ALTER TABLE message_threads ADD COLUMN IF NOT EXISTS is_unlocked BOOLEAN DEFAULT FALSE")
+        cur.execute("ALTER TABLE message_threads ADD COLUMN IF NOT EXISTS created_at TIMESTAMP DEFAULT NOW()")
+        cur.execute("""
+            DO $$
+            BEGIN
+              IF NOT EXISTS (
+                SELECT 1 FROM pg_indexes WHERE indexname = 'idx_message_threads_unique_triplet'
+              ) THEN
+                CREATE UNIQUE INDEX idx_message_threads_unique_triplet
+                ON message_threads(listing_id, renter_email, lister_email);
+              END IF;
+            END$$
+        """)
+        conn.commit()
+    finally:
+        try: cur.close(); conn.close()
+        except Exception: pass
 
 def _prune_legacy_delete_route():
-    """
-    Remove any older DELETE /delete-listing/{listing_id} route not backed by our fallback/admin functions.
-    This prevents shadowing by stale handlers named `delete_listing`.
-    """
     new_routes = []
     for r in app.router.routes:
         path = getattr(r, "path", None)
@@ -147,7 +187,6 @@ def _prune_legacy_delete_route():
         ep = getattr(r, "endpoint", None)
         epname = getattr(ep, "__name__", "") if ep else ""
         if path == "/delete-listing/{listing_id}" and "DELETE" in methods and epname not in {"delete_listing_fallback", "admin_delete_listing"}:
-            # drop the legacy route
             continue
         new_routes.append(r)
     app.router.routes = new_routes
@@ -155,6 +194,7 @@ def _prune_legacy_delete_route():
 @app.on_event("startup")
 def _startup():
     ensure_aux_tables()
+    ensure_core_columns_and_indexes()
     _prune_legacy_delete_route()
 
 # ---------------------- Auth helpers ----------------------
@@ -182,7 +222,6 @@ def decode_token(token: str) -> str:
 def is_admin(email: str) -> bool:
     return (email or "").lower() in ADMIN_EMAILS
 
-# dependency: read Authorization header
 def verify_token(authorization: Optional[str] = Header(None)) -> str:
     if not authorization or not authorization.lower().startswith("bearer "):
         raise HTTPException(status_code=401, detail="Missing bearer token")
@@ -192,7 +231,6 @@ def verify_token(authorization: Optional[str] = Header(None)) -> str:
 def outward_prefix(loc: Optional[str]) -> str:
     if not loc:
         return ""
-    # outward postcode only
     first = (loc.split("—")[0]).split("-")[0].split(",")[0].strip().split()
     return (first[0] if first else "").upper()
 
@@ -203,15 +241,9 @@ def send_alert_email(to_email: str, subject: str, html: str) -> None:
         if not (to_email and SENDGRID_API_KEY and SendGridAPIClient and Mail):
             return
         sg = SendGridAPIClient(SENDGRID_API_KEY)
-        msg = Mail(
-            from_email=ALERT_FROM_EMAIL,
-            to_emails=to_email,
-            subject=subject,
-            html_content=html,
-        )
+        msg = Mail(from_email=ALERT_FROM_EMAIL, to_emails=to_email, subject=subject, html_content=html)
         sg.send(msg)
     except Exception:
-        # never fail the API on email issues
         pass
 
 # ---------------------- Stripe helpers ----------------------
@@ -245,11 +277,8 @@ def set_connect_account_id(email: str, account_id: str) -> None:
         cur.close(); conn.close()
 
 def require_lister_ready_for_payments(lister_email: str) -> Optional[str]:
-    """
-    Returns None if ready; returns onboarding URL if not ready.
-    """
     if not stripe_ready():
-        return None  # don't block when Stripe not configured
+        return None
     stripe_set_key()
     acct_id = get_connect_account_id(lister_email)
     if not acct_id:
@@ -292,7 +321,7 @@ class DeclineIn(BaseModel):
     reason: Optional[str] = None
 
 class AcceptIn(BaseModel):
-    note: Optional[str] = None  # placeholder for future
+    note: Optional[str] = None
 
 class CheckoutStartIn(BaseModel):
     request_id: Union[int, str]
@@ -307,9 +336,7 @@ class MessageSendIn(BaseModel):
 def signup(payload: SignupIn):
     email = payload.email.lower()
     password_hash = hash_password(payload.password)
-
-    conn = get_db_connection()
-    cur = conn.cursor()
+    conn = get_db_connection(); cur = conn.cursor()
     try:
         cur.execute("SELECT 1 FROM users WHERE email=%s", (email,))
         if cur.fetchone():
@@ -326,60 +353,13 @@ def signup(payload: SignupIn):
 
 @app.post("/login")
 def login(payload: LoginIn):
-    """
-    Backwards-compatible login:
-    - prefers bcrypt in users.password_hash
-    - falls back to users.password (bcrypt or plaintext)
-    - if plaintext matches, migrate to bcrypt immediately
-    """
     email = payload.email.lower()
     conn = get_db_connection(); cur = conn.cursor()
     try:
-        try:
-            cur.execute("SELECT password_hash, password FROM users WHERE email=%s", (email,))
-        except Exception:
-            cur.execute("SELECT password FROM users WHERE email=%s", (email,))
+        cur.execute("SELECT password_hash FROM users WHERE email=%s", (email,))
         row = cur.fetchone()
-        if not row:
+        if not row or not verify_password(payload.password, row[0]):
             raise HTTPException(status_code=401, detail="Invalid credentials")
-
-        pwd_hash = row[0] if len(row) > 0 else None
-        legacy = row[1] if len(row) > 1 else None
-
-        candidate = payload.password
-        ok = False
-
-        # preferred hash
-        if pwd_hash:
-            try:
-                ok = bcrypt.checkpw(candidate.encode(), str(pwd_hash).encode())
-            except Exception:
-                ok = False
-
-        # legacy fallback
-        if not ok and legacy is not None:
-            legacy = str(legacy)
-            if legacy.startswith("$2"):  # bcrypt marker
-                try:
-                    ok = bcrypt.checkpw(candidate.encode(), legacy.encode())
-                except Exception:
-                    ok = False
-            else:
-                ok = (legacy == candidate)
-                if ok:
-                    # migrate on the spot
-                    try:
-                        cur.execute(
-                            "UPDATE users SET password_hash=%s, password=NULL WHERE email=%s",
-                            (hash_password(candidate), email),
-                        )
-                        conn.commit()
-                    except Exception:
-                        conn.rollback()
-
-        if not ok:
-            raise HTTPException(status_code=401, detail="Invalid credentials")
-
         token = create_access_token(email)
         return {"token": token, "email": email}
     finally:
@@ -401,11 +381,6 @@ def get_listings():
         return fetch_all_dict(cur)
     finally:
         cur.close(); conn.close()
-
-# Public alias some dashboards still call
-@app.get("/all-listings")
-def get_all_listings_alias():
-    return get_listings()
 
 @app.get("/listing/{listing_id}")
 def get_listing(listing_id: Union[int, str]):
@@ -438,7 +413,6 @@ def create_listing(
         price_num = float(str(price_per_day).replace(",", ""))
     except Exception:
         raise HTTPException(status_code=400, detail="Invalid price")
-
     conn = get_db_connection(); cur = conn.cursor()
     try:
         cur.execute("""
@@ -471,16 +445,13 @@ def update_listing(
         if row[0] != current_user and not is_admin(current_user):
             raise HTTPException(status_code=403, detail="Forbidden")
 
-        fields = []
-        values = []
+        fields, values = [], []
         if name is not None: fields.append("name=%s"); values.append(name)
         if description is not None: fields.append("description=%s"); values.append(description)
         if location is not None: fields.append("location=%s"); values.append(outward_prefix(location))
         if price_per_day is not None:
-            try:
-                price_num = float(str(price_per_day).replace(",", ""))
-            except Exception:
-                raise HTTPException(status_code=400, detail="Invalid price")
+            try: price_num = float(str(price_per_day).replace(",", ""))
+            except Exception: raise HTTPException(status_code=400, detail="Invalid price")
             fields.append("price_per_day=%s"); values.append(price_num)
         if image_url is not None: fields.append("image_url=%s"); values.append(image_url)
         if not fields:
@@ -508,7 +479,7 @@ def my_listings(current_user: str = Depends(verify_token)):
     finally:
         cur.close(); conn.close()
 
-# --- Admin soft-delete / restore / hard-delete ---
+# ---------------------- Admin moderation + listing fetch ----------------------
 
 @app.post("/admin/listings/{listing_id}/soft-delete")
 def admin_soft_delete_listing(listing_id: Union[int, str], current_user: str = Depends(verify_token)):
@@ -550,12 +521,10 @@ def admin_delete_listing(listing_id: Union[int, str], current_user: str = Depend
             raise HTTPException(status_code=404, detail="Listing not found")
         owner_email = row.get("owner_email",""); name = row.get("name","")
 
-        # Delete dependents first (manual cascade)
         cur.execute("DELETE FROM messages WHERE thread_id IN (SELECT id FROM message_threads WHERE listing_id=%s)", (str(listing_id),))
         cur.execute("DELETE FROM message_threads WHERE listing_id=%s", (str(listing_id),))
         cur.execute("DELETE FROM rental_requests WHERE listing_id=%s", (str(listing_id),))
         cur.execute("DELETE FROM rentals WHERE listing_id=%s", (str(listing_id),))
-
         cur.execute("DELETE FROM listings WHERE id=%s", (str(listing_id),))
         conn.commit()
 
@@ -568,10 +537,44 @@ def admin_delete_listing(listing_id: Union[int, str], current_user: str = Depend
 
 @app.delete("/delete-listing/{listing_id}")
 def delete_listing_fallback(listing_id: Union[int, str], current_user: str = Depends(verify_token)):
-    # Keep admin-only for safety; this simply delegates to admin delete
     if not is_admin(current_user):
         raise HTTPException(status_code=403, detail="Admin only")
     return admin_delete_listing(listing_id, current_user)
+
+@app.get("/admin/listings")
+def admin_listings(
+    include_deleted: bool = Query(False),
+    owner: Optional[str] = Query(None),
+    q: Optional[str] = Query(None, description="search by name/location"),
+    limit: int = Query(500, ge=1, le=2000),
+    offset: int = Query(0, ge=0),
+    current_user: str = Depends(verify_token),
+):
+    if not is_admin(current_user):
+        raise HTTPException(status_code=403, detail="Admin only")
+    conn = get_db_connection(); cur = conn.cursor()
+    try:
+        where = []
+        params: List[Any] = []
+        if not include_deleted:
+            where.append("deleted_at IS NULL")
+        if owner:
+            where.append("owner_email=%s"); params.append(owner.lower())
+        if q:
+            where.append("(name ILIKE %s OR location ILIKE %s)")
+            params.extend([f"%{q}%", f"%{q}%"])
+        where_sql = ("WHERE " + " AND ".join(where)) if where else ""
+        cur.execute(f"""
+            SELECT id, name, description, location, image_url,
+                   price_per_day, owner_email, created_at, deleted_at
+            FROM listings
+            {where_sql}
+            ORDER BY COALESCE(deleted_at, created_at) DESC
+            LIMIT %s OFFSET %s
+        """, (*params, limit, offset))
+        return fetch_all_dict(cur)
+    finally:
+        cur.close(); conn.close()
 
 # ---------------------- Rental Requests ----------------------
 
@@ -589,14 +592,13 @@ def request_to_rent(payload: RequestToRentIn, current_user: str = Depends(verify
         raise HTTPException(status_code=400, detail="End date must be on/after start date")
 
     listing_id = str(payload.listing_id)
-
     conn = get_db_connection(); cur = conn.cursor()
     try:
         cur.execute("SELECT id, name, owner_email, price_per_day FROM listings WHERE id=%s AND deleted_at IS NULL", (listing_id,))
         row = cur.fetchone()
         if not row:
             raise HTTPException(status_code=404, detail="Listing not found")
-        listing_name = row[1]; lister_email = row[2]; price_per_day = float(row[3] or 0)
+        listing_name, lister_email, price_per_day = row[1], row[2], float(row[3] or 0)
 
         cur.execute("""
             INSERT INTO rental_requests (listing_id, renter_email, lister_email, start_date, end_date, status, request_time)
@@ -608,7 +610,7 @@ def request_to_rent(payload: RequestToRentIn, current_user: str = Depends(verify
         ensure_thread(cur, listing_id, renter_email, lister_email)
         conn.commit()
 
-        # Email lister (best-effort)
+        # email lister (best-effort)
         star = renter_email[0] if renter_email else ""
         obfuscated = (star + "******@" + renter_email.split("@")[1]) if "@" in renter_email else renter_email
         html = f"""
@@ -659,6 +661,57 @@ def my_rental_requests(
     finally:
         cur.close(); conn.close()
 
+# Compat alias so existing UIs calling /rental-requests keep working.
+@app.get("/rental-requests")
+def compat_rental_requests(
+    role: Optional[str] = Query(None, description="renter|lister|all|admin_all"),
+    limit: int = Query(200, ge=1, le=1000),
+    offset: int = Query(0, ge=0),
+    current_user: str = Depends(verify_token),
+):
+    # If admin and wants site-wide: role=admin_all OR role=all with admin
+    if is_admin(current_user) and (role == "admin_all" or role == "all"):
+        conn = get_db_connection(); cur = conn.cursor()
+        try:
+            cur.execute(f"""
+                SELECT rr.id, rr.listing_id, COALESCE(l.name,'') AS listing_name,
+                       rr.renter_email, rr.lister_email, rr.start_date, rr.end_date,
+                       COALESCE(rr.status,'') AS status, COALESCE(rr.request_time,NOW()) AS request_time
+                FROM rental_requests rr
+                LEFT JOIN listings l ON l.id = rr.listing_id
+                ORDER BY rr.request_time DESC
+                LIMIT %s OFFSET %s
+            """, (limit, offset))
+            return fetch_all_dict(cur)
+        finally:
+            cur.close(); conn.close()
+    # otherwise behave like /my-rental-requests
+    return my_rental_requests(role=role, current_user=current_user)
+
+# Keep explicit admin endpoint too
+@app.get("/admin/all-rental-requests")
+def admin_all_rental_requests(
+    limit: int = Query(200, ge=1, le=1000),
+    offset: int = Query(0, ge=0),
+    current_user: str = Depends(verify_token)
+):
+    if not is_admin(current_user):
+        raise HTTPException(status_code=403, detail="Admin only")
+    conn = get_db_connection(); cur = conn.cursor()
+    try:
+        cur.execute(f"""
+            SELECT rr.id, rr.listing_id, COALESCE(l.name,'') AS listing_name,
+                   rr.renter_email, rr.lister_email, rr.start_date, rr.end_date,
+                   COALESCE(rr.status,'') AS status, COALESCE(rr.request_time,NOW()) AS request_time
+            FROM rental_requests rr
+            LEFT JOIN listings l ON l.id = rr.listing_id
+            ORDER BY rr.request_time DESC
+            LIMIT %s OFFSET %s
+        """, (limit, offset))
+        return fetch_all_dict(cur)
+    finally:
+        cur.close(); conn.close()
+
 # ---------------------- Accept / Decline ----------------------
 
 @app.post("/rental-requests/{request_id}/accept")
@@ -677,7 +730,6 @@ def accept_request(request_id: Union[int, str], payload: AcceptIn = Body(None), 
         if r["lister_email"] != current_user and not is_admin(current_user):
             raise HTTPException(status_code=403, detail="Only the lister can accept")
 
-        # Enforce Stripe onboarding (only if Stripe configured)
         onboarding_url = require_lister_ready_for_payments(r["lister_email"])
         if onboarding_url:
             raise HTTPException(status_code=409, detail={"onboarding_url": onboarding_url})
@@ -726,7 +778,7 @@ def decline_request(request_id: Union[int, str], payload: DeclineIn = Body(...),
     finally:
         cur.close(); conn.close()
 
-# ---------------------- Messaging (with server-side PII guard) ----------------------
+# ---------------------- Messaging (PII guard until paid) ----------------------
 
 EMAIL_RE = re.compile(r"[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}", re.I)
 PHONE_RE = re.compile(r"(\+?\d[\d\-\s\(\)]{7,}\d)")
@@ -734,10 +786,7 @@ URL_RE = re.compile(r"(https?://|www\.)", re.I)
 
 def contains_pii(text: str) -> bool:
     t = text or ""
-    if EMAIL_RE.search(t): return True
-    if PHONE_RE.search(t): return True
-    if URL_RE.search(t): return True
-    return False
+    return bool(EMAIL_RE.search(t) or PHONE_RE.search(t) or URL_RE.search(t))
 
 @app.get("/message-threads")
 def list_threads(current_user: str = Depends(verify_token)):
@@ -794,9 +843,8 @@ def send_message(payload: MessageSendIn, current_user: str = Depends(verify_toke
         renter, lister, unlocked = row[0], row[1], bool(row[2])
         if current_user not in (renter, lister):
             raise HTTPException(status_code=403, detail="Not a participant")
-        if not unlocked:
-            if contains_pii(body):
-                raise HTTPException(status_code=403, detail="PII (email/phone/URL) not allowed before payment")
+        if not unlocked and contains_pii(body):
+            raise HTTPException(status_code=403, detail="PII (email/phone/URL) not allowed before payment")
 
         cur.execute("""
             INSERT INTO messages (thread_id, sender_email, body, created_at, system)
@@ -806,93 +854,6 @@ def send_message(payload: MessageSendIn, current_user: str = Depends(verify_toke
         return {"ok": True}
     finally:
         cur.close(); conn.close()
-
-# ---------------------- Admin ----------------------
-
-@app.get("/admin/all-rental-requests")
-def admin_all_rental_requests(
-    limit: int = Query(200, ge=1, le=1000),
-    offset: int = Query(0, ge=0),
-    current_user: str = Depends(verify_token)
-):
-    if not is_admin(current_user):
-        raise HTTPException(status_code=403, detail="Admin only")
-    conn = get_db_connection(); cur = conn.cursor()
-    try:
-        cur.execute("""
-            SELECT rr.id, rr.listing_id, COALESCE(l.name,'') AS listing_name,
-                   rr.renter_email, rr.lister_email, rr.start_date, rr.end_date,
-                   COALESCE(rr.status,'') AS status, COALESCE(rr.request_time,NOW()) AS request_time
-            FROM rental_requests rr
-            LEFT JOIN listings l ON l.id = rr.listing_id
-            ORDER BY rr.request_time DESC
-            LIMIT %s OFFSET %s
-        """, (limit, offset))
-        return fetch_all_dict(cur)
-    finally:
-        cur.close(); conn.close()
-
-# Admin: list all listings (optionally include deleted)
-@app.get("/admin/listings")
-def admin_listings(
-    include_deleted: bool = Query(False),
-    limit: int = Query(200, ge=1, le=1000),
-    offset: int = Query(0, ge=0),
-    current_user: str = Depends(verify_token),
-):
-    if not is_admin(current_user):
-        raise HTTPException(status_code=403, detail="Admin only")
-    conn = get_db_connection(); cur = conn.cursor()
-    try:
-        if include_deleted:
-            cur.execute("""
-                SELECT id, name, description, location, image_url, price_per_day,
-                       owner_email, created_at, deleted_at
-                FROM listings
-                ORDER BY created_at DESC
-                LIMIT %s OFFSET %s
-            """, (limit, offset))
-        else:
-            cur.execute("""
-                SELECT id, name, description, location, image_url, price_per_day,
-                       owner_email, created_at, deleted_at
-                FROM listings
-                WHERE deleted_at IS NULL
-                ORDER BY created_at DESC
-                LIMIT %s OFFSET %s
-            """, (limit, offset))
-        return fetch_all_dict(cur)
-    finally:
-        cur.close(); conn.close()
-
-# Compatibility alias some frontends call:
-@app.get("/rental-requests")
-def rental_requests_alias(
-    role: Optional[str] = Query(None),
-    limit: Optional[int] = Query(None),
-    offset: Optional[int] = Query(None),
-    current_user: str = Depends(verify_token),
-):
-    if is_admin(current_user):
-        # Admin view when called without params
-        lim = limit if isinstance(limit, int) and 1 <= limit <= 1000 else 200
-        off = offset if isinstance(offset, int) and offset >= 0 else 0
-        conn = get_db_connection(); cur = conn.cursor()
-        try:
-            cur.execute("""
-                SELECT rr.id, rr.listing_id, COALESCE(l.name,'') AS listing_name,
-                       rr.renter_email, rr.lister_email, rr.start_date, rr.end_date,
-                       COALESCE(rr.status,'') AS status, COALESCE(rr.request_time,NOW()) AS request_time
-                FROM rental_requests rr
-                LEFT JOIN listings l ON l.id = rr.listing_id
-                ORDER BY rr.request_time DESC
-                LIMIT %s OFFSET %s
-            """, (lim, off))
-            return fetch_all_dict(cur)
-        finally:
-            cur.close(); conn.close()
-    # Non-admin → reuse my_rental_requests behaviour
-    return my_rental_requests(role=role, current_user=current_user)
 
 # ---------------------- Stripe ----------------------
 
@@ -920,7 +881,6 @@ def stripe_checkout_start(payload: CheckoutStartIn, current_user: str = Depends(
         raise HTTPException(status_code=409, detail="Stripe not configured")
     stripe_set_key()
 
-    # Fetch request + listing
     conn = get_db_connection(); cur = conn.cursor()
     try:
         cur.execute("""
@@ -933,17 +893,13 @@ def stripe_checkout_start(payload: CheckoutStartIn, current_user: str = Depends(
         r = fetch_one_dict(cur)
         if not r:
             raise HTTPException(status_code=404, detail="Request not found")
-
-        # Only renter can pay
         if r["renter_email"] != current_user and not is_admin(current_user):
             raise HTTPException(status_code=403, detail="Only the renter can pay")
 
-        # Lister must have/complete onboarding
         onboarding_url = require_lister_ready_for_payments(r["lister_email"])
         if onboarding_url:
             raise HTTPException(status_code=409, detail={"onboarding_url": onboarding_url})
 
-        # Amounts
         days = (r["end_date"] - r["start_date"]).days + 1 if r["start_date"] and r["end_date"] else 1
         days = max(1, days)
         base_per_day = float(r.get("price_per_day", 0) or 0)
@@ -951,7 +907,6 @@ def stripe_checkout_start(payload: CheckoutStartIn, current_user: str = Depends(
         final_total_p = int(round(base_total_p * (1.0 + PLATFORM_FEE_RATE)))
         fee_p = final_total_p - base_total_p
 
-        # Destination charge to lister's connected account
         lister_acct = get_connect_account_id(r["lister_email"])
         if not lister_acct:
             onboarding_url = require_lister_ready_for_payments(r["lister_email"])
@@ -1003,7 +958,6 @@ async def stripe_webhook(request: Request):
     stripe_set_key()
     payload = await request.body()
     sig_header = request.headers.get("stripe-signature", "")
-
     try:
         event = stripe_sdk.Webhook.construct_event(payload, sig_header, STRIPE_WEBHOOK_SECRET)
     except Exception:
@@ -1014,7 +968,6 @@ async def stripe_webhook(request: Request):
     event_type = event.get("type")
 
     if event_type in ("checkout.session.completed", "payment_intent.succeeded"):
-        # Collect metadata (may be on PI)
         if event_type == "checkout.session.completed" and "payment_intent" in obj and isinstance(obj["payment_intent"], str):
             pi = stripe_sdk.PaymentIntent.retrieve(obj["payment_intent"])
             meta = pi.get("metadata", {}) or meta
@@ -1033,51 +986,37 @@ async def stripe_webhook(request: Request):
         if req_id and listing_id and renter_email and lister_email:
             conn = get_db_connection(); cur = conn.cursor()
             try:
-                # Mark paid
                 cur.execute("UPDATE rental_requests SET status='paid', updated_at=NOW() WHERE id=%s", (str(req_id),))
-                # Unlock thread
                 cur.execute("""
                     UPDATE message_threads
-                    SET is_unlocked=TRUE
-                    WHERE listing_id=%s AND renter_email=%s AND lister_email=%s
+                       SET is_unlocked=TRUE
+                     WHERE listing_id=%s AND renter_email=%s AND lister_email=%s
                 """, (str(listing_id), renter_email, lister_email))
-                # System message
                 cur.execute("""
                     INSERT INTO messages (thread_id, sender_email, body, created_at, system)
                     SELECT id, %s, %s, NOW(), TRUE
-                    FROM message_threads
-                    WHERE listing_id=%s AND renter_email=%s AND lister_email=%s
+                      FROM message_threads
+                     WHERE listing_id=%s AND renter_email=%s AND lister_email=%s
                 """, ("system@rentonomic", "Payment confirmed. Messaging unlocked.", str(listing_id), renter_email, lister_email))
-                # Create rentals row (idempotent via UNIQUE on request_id)
                 cur.execute("""
                     INSERT INTO rentals (request_id, listing_id, renter_email, lister_email,
                                          start_date, end_date, amount_base_pence, amount_renter_pence, platform_fee_pence)
                     SELECT rr.id, rr.listing_id, rr.renter_email, rr.lister_email,
                            rr.start_date, rr.end_date, %s, %s, %s
-                    FROM rental_requests rr
-                    WHERE rr.id=%s
+                      FROM rental_requests rr
+                     WHERE rr.id=%s
                     ON CONFLICT (request_id) DO NOTHING
                 """, (base_total_p, final_total_p, fee_p, str(req_id)))
                 conn.commit()
             finally:
-                try:
-                    cur.close()
-                    conn.close()
-                except Exception:
-                    pass
+                try: cur.close(); conn.close()
+                except Exception: pass
 
-            # Email both parties (best-effort)
             try:
-                send_alert_email(
-                    renter_email,
-                    "Payment received — booking confirmed",
-                    "<p>Your payment was successful. The chat is now unlocked.</p>"
-                )
-                send_alert_email(
-                    lister_email,
-                    "Your item has been booked",
-                    "<p>The renter has paid. You can now chat and arrange handover.</p>"
-                )
+                send_alert_email(renter_email, "Payment received — booking confirmed",
+                                 "<p>Your payment was successful. The chat is now unlocked.</p>")
+                send_alert_email(lister_email, "Your item has been booked",
+                                 "<p>The renter has paid. You can now chat and arrange handover.</p>")
             except Exception:
                 pass
 
@@ -1088,6 +1027,8 @@ async def stripe_webhook(request: Request):
 @app.get("/")
 def root():
     return {"ok": True, "service": "rentonomic-api"}
+
+
 
 
 
