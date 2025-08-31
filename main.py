@@ -1,20 +1,11 @@
-# main.py — Rentonomic (FastAPI) — production build (safe auto-migrations)
+# main.py — Rentonomic (FastAPI) — production build (fault-tolerant startup)
 # ----------------------------------------------------------------------------------------
-# Features
-# - Auth (JWT)
-# - Listings: public list/get, create, update, my-listings
-# - Admin moderation: soft-delete, restore, hard-delete + GET /admin/listings
-# - Rental requests: create, my-rental-requests (renter|lister|all) + compat GET /rental-requests
-# - Accept/Decline; Stripe Connect checkout + webhook unlocks chat, records rentals
-# - Messaging threads/messages with server PII guard pre-payment
-# - Email via SendGrid (best-effort)
-# - Outward postcode rule enforced server-side
-# - CORS for production + localhost
-# - Startup auto-migrations: guard table/column existence, conditional backfill of owner_email
-# - Startup guard to prune any legacy /delete-listing route
+# Same features as before (auth, listings, requests, messaging, Stripe, email, CORS)
+# PLUS: startup won’t crash if DB/schema is off. Problems are logged and can be
+# inspected via GET /__diag/db (admin-only).
 # ----------------------------------------------------------------------------------------
 
-import os, re
+import os, re, logging
 from typing import Optional, Union, Dict, Any, List
 from datetime import datetime, timedelta, date
 
@@ -40,8 +31,12 @@ try:
 except Exception:
     stripe_sdk = None
 
-# ---------------------- Config ----------------------
+# ---------------------- Logging ----------------------
+LOG_LEVEL = os.environ.get("LOG_LEVEL", "INFO").upper()
+logging.basicConfig(level=LOG_LEVEL)
+log = logging.getLogger("rentonomic")
 
+# ---------------------- Config ----------------------
 DATABASE_URL = os.environ.get("DATABASE_URL", "")
 JWT_SECRET = os.environ.get("JWT_SECRET", "change-me")
 JWT_ALG = "HS256"
@@ -55,6 +50,9 @@ STRIPE_WEBHOOK_SECRET = os.environ.get("STRIPE_WEBHOOK_SECRET", "")
 FRONTEND_BASE = os.environ.get("FRONTEND_BASE", "https://rentonomic.com")
 
 PLATFORM_FEE_RATE = 0.10  # 10%
+
+# If true, migrations that fail will be logged and ignored (service still starts).
+SOFT_STARTUP = os.environ.get("SOFT_STARTUP", "1") != "0"
 
 app = FastAPI(title="Rentonomic API")
 
@@ -75,7 +73,6 @@ app.add_middleware(
 )
 
 # ---------------------- DB helpers ----------------------
-
 def get_db_connection():
     if not DATABASE_URL:
         raise RuntimeError("DATABASE_URL not set")
@@ -109,10 +106,8 @@ def column_exists(cur, table: str, column: str) -> bool:
     return cur.fetchone() is not None
 
 def ensure_aux_tables():
-    """Create auxiliary tables if they don't exist (safe/idempotent)."""
     conn = get_db_connection(); cur = conn.cursor()
     try:
-        # Stripe accounts registry
         cur.execute("""
             CREATE TABLE IF NOT EXISTS stripe_accounts (
                 email TEXT PRIMARY KEY,
@@ -120,7 +115,6 @@ def ensure_aux_tables():
                 created_at TIMESTAMP NOT NULL DEFAULT NOW()
             )
         """)
-        # Rentals summary (inserted at webhook)
         cur.execute("""
             CREATE TABLE IF NOT EXISTS rentals (
                 id SERIAL PRIMARY KEY,
@@ -139,24 +133,20 @@ def ensure_aux_tables():
         # messages.system flag
         if table_exists(cur, "messages") and not column_exists(cur, "messages", "system"):
             cur.execute("ALTER TABLE messages ADD COLUMN IF NOT EXISTS system BOOLEAN DEFAULT FALSE")
-        # Helpful indexes
+        # Indexes
         cur.execute("CREATE INDEX IF NOT EXISTS idx_rentals_listing ON rentals(listing_id)")
         if table_exists(cur, "messages"):
             cur.execute("CREATE INDEX IF NOT EXISTS idx_messages_thread ON messages(thread_id)")
         conn.commit()
+        log.info("Aux tables ensured")
     finally:
         try: cur.close(); conn.close()
         except Exception: pass
 
 def ensure_core_columns_and_indexes():
-    """
-    Keep core tables aligned with code. Adds columns if missing and creates indexes.
-    Backfills owner_email ONLY from columns that actually exist.
-    Everything is guarded so missing legacy columns never crash startup.
-    """
     conn = get_db_connection(); cur = conn.cursor()
     try:
-        # ---- listings ----
+        # listings
         if table_exists(cur, "listings"):
             if not column_exists(cur, "listings", "owner_email"):
                 cur.execute("ALTER TABLE listings ADD COLUMN owner_email TEXT")
@@ -165,31 +155,22 @@ def ensure_core_columns_and_indexes():
             if not column_exists(cur, "listings", "deleted_at"):
                 cur.execute("ALTER TABLE listings ADD COLUMN deleted_at TIMESTAMP NULL")
 
-            # Conditional backfill from whichever legacy column exists
+            # Conditional backfill
             if column_exists(cur, "listings", "email"):
                 cur.execute("""
-                    UPDATE listings
-                       SET owner_email = email
+                    UPDATE listings SET owner_email = email
                      WHERE owner_email IS NULL AND email IS NOT NULL
                 """)
             if column_exists(cur, "listings", "user_email"):
                 cur.execute("""
-                    UPDATE listings
-                       SET owner_email = user_email
+                    UPDATE listings SET owner_email = user_email
                      WHERE owner_email IS NULL AND user_email IS NOT NULL
                 """)
-
-            # Ensure created_at not null
-            cur.execute("""
-                UPDATE listings
-                   SET created_at = COALESCE(created_at, NOW())
-                 WHERE created_at IS NULL
-            """)
-
+            cur.execute("UPDATE listings SET created_at = COALESCE(created_at, NOW()) WHERE created_at IS NULL")
             cur.execute("CREATE INDEX IF NOT EXISTS idx_listings_owner_email ON listings(owner_email)")
             cur.execute("CREATE INDEX IF NOT EXISTS idx_listings_deleted ON listings(deleted_at)")
 
-        # ---- rental_requests ----
+        # rental_requests
         if table_exists(cur, "rental_requests"):
             if not column_exists(cur, "rental_requests", "status"):
                 cur.execute("ALTER TABLE rental_requests ADD COLUMN status TEXT")
@@ -197,25 +178,20 @@ def ensure_core_columns_and_indexes():
                 cur.execute("ALTER TABLE rental_requests ADD COLUMN request_time TIMESTAMP")
             if not column_exists(cur, "rental_requests", "updated_at"):
                 cur.execute("ALTER TABLE rental_requests ADD COLUMN updated_at TIMESTAMP")
-
-            # Defaults if null
             cur.execute("UPDATE rental_requests SET status = COALESCE(status, 'requested')")
             cur.execute("UPDATE rental_requests SET request_time = COALESCE(request_time, NOW())")
-
             cur.execute("CREATE INDEX IF NOT EXISTS idx_rr_lister ON rental_requests(lister_email)")
             cur.execute("CREATE INDEX IF NOT EXISTS idx_rr_renter ON rental_requests(renter_email)")
             cur.execute("CREATE INDEX IF NOT EXISTS idx_rr_listing ON rental_requests(listing_id)")
 
-        # ---- message_threads ----
+        # message_threads
         if table_exists(cur, "message_threads"):
             if not column_exists(cur, "message_threads", "is_unlocked"):
                 cur.execute("ALTER TABLE message_threads ADD COLUMN is_unlocked BOOLEAN")
             if not column_exists(cur, "message_threads", "created_at"):
                 cur.execute("ALTER TABLE message_threads ADD COLUMN created_at TIMESTAMP")
-            # Set defaults if null
             cur.execute("UPDATE message_threads SET is_unlocked = COALESCE(is_unlocked, FALSE)")
             cur.execute("UPDATE message_threads SET created_at = COALESCE(created_at, NOW())")
-            # Unique triplet
             cur.execute("""
                 DO $$
                 BEGIN
@@ -228,6 +204,7 @@ def ensure_core_columns_and_indexes():
                 END$$
             """)
         conn.commit()
+        log.info("Core columns/indexes ensured")
     finally:
         try: cur.close(); conn.close()
         except Exception: pass
@@ -246,12 +223,26 @@ def _prune_legacy_delete_route():
 
 @app.on_event("startup")
 def _startup():
-    ensure_aux_tables()
-    ensure_core_columns_and_indexes()
-    _prune_legacy_delete_route()
+    # Fault-tolerant migrations: never crash startup.
+    if not DATABASE_URL:
+        log.warning("DATABASE_URL not set — skipping DB migrations at startup")
+    else:
+        try:
+            ensure_aux_tables()
+        except Exception as e:
+            log.exception("ensure_aux_tables failed: %s", e)
+            if not SOFT_STARTUP: raise
+        try:
+            ensure_core_columns_and_indexes()
+        except Exception as e:
+            log.exception("ensure_core_columns_and_indexes failed: %s", e)
+            if not SOFT_STARTUP: raise
+    try:
+        _prune_legacy_delete_route()
+    except Exception as e:
+        log.exception("Route pruning failed (continuing): %s", e)
 
 # ---------------------- Auth helpers ----------------------
-
 def hash_password(pw: str) -> str:
     return bcrypt.hashpw(pw.encode("utf-8"), bcrypt.gensalt()).decode("utf-8")
 
@@ -282,13 +273,11 @@ def verify_token(authorization: Optional[str] = Header(None)) -> str:
     return decode_token(token)
 
 def outward_prefix(loc: Optional[str]) -> str:
-    if not loc:
-        return ""
+    if not loc: return ""
     first = (loc.split("—")[0]).split("-")[0].split(",")[0].strip().split()
     return (first[0] if first else "").upper()
 
 # ---------------------- Email (best-effort) ----------------------
-
 def send_alert_email(to_email: str, subject: str, html: str) -> None:
     try:
         if not (to_email and SENDGRID_API_KEY and SendGridAPIClient and Mail):
@@ -300,7 +289,6 @@ def send_alert_email(to_email: str, subject: str, html: str) -> None:
         pass
 
 # ---------------------- Stripe helpers ----------------------
-
 def stripe_ready() -> bool:
     return bool(stripe_sdk and STRIPE_SECRET_KEY)
 
@@ -356,7 +344,6 @@ def require_lister_ready_for_payments(lister_email: str) -> Optional[str]:
     return None
 
 # ---------------------- Models ----------------------
-
 class SignupIn(BaseModel):
     email: EmailStr
     password: str
@@ -384,7 +371,6 @@ class MessageSendIn(BaseModel):
     body: str
 
 # ---------------------- Auth routes ----------------------
-
 @app.post("/signup")
 def signup(payload: SignupIn):
     email = payload.email.lower()
@@ -419,7 +405,6 @@ def login(payload: LoginIn):
         cur.close(); conn.close()
 
 # ---------------------- Listings ----------------------
-
 @app.get("/listings")
 def get_listings():
     conn = get_db_connection(); cur = conn.cursor()
@@ -533,7 +518,6 @@ def my_listings(current_user: str = Depends(verify_token)):
         cur.close(); conn.close()
 
 # ---------------------- Admin moderation + listing fetch ----------------------
-
 @app.post("/admin/listings/{listing_id}/soft-delete")
 def admin_soft_delete_listing(listing_id: Union[int, str], current_user: str = Depends(verify_token)):
     if not is_admin(current_user):
@@ -574,12 +558,10 @@ def admin_delete_listing(listing_id: Union[int, str], current_user: str = Depend
             raise HTTPException(status_code=404, detail="Listing not found")
         owner_email = row.get("owner_email",""); name = row.get("name","")
 
-        # Manual cascade of dependents
         cur.execute("DELETE FROM messages WHERE thread_id IN (SELECT id FROM message_threads WHERE listing_id=%s)", (str(listing_id),))
         cur.execute("DELETE FROM message_threads WHERE listing_id=%s", (str(listing_id),))
         cur.execute("DELETE FROM rental_requests WHERE listing_id=%s", (str(listing_id),))
         cur.execute("DELETE FROM rentals WHERE listing_id=%s", (str(listing_id),))
-
         cur.execute("DELETE FROM listings WHERE id=%s", (str(listing_id),))
         conn.commit()
 
@@ -632,7 +614,6 @@ def admin_listings(
         cur.close(); conn.close()
 
 # ---------------------- Rental Requests ----------------------
-
 def ensure_thread(cur, listing_id: str, renter_email: str, lister_email: str) -> None:
     cur.execute("""
         INSERT INTO message_threads (listing_id, renter_email, lister_email, is_unlocked, created_at)
@@ -716,7 +697,7 @@ def my_rental_requests(
     finally:
         cur.close(); conn.close()
 
-# Compat alias so existing UIs calling /rental-requests keep working.
+# Compat alias for older UIs
 @app.get("/rental-requests")
 def compat_rental_requests(
     role: Optional[str] = Query(None, description="renter|lister|all|admin_all"),
@@ -765,7 +746,6 @@ def admin_all_rental_requests(
         cur.close(); conn.close()
 
 # ---------------------- Accept / Decline ----------------------
-
 @app.post("/rental-requests/{request_id}/accept")
 def accept_request(request_id: Union[int, str], payload: AcceptIn = Body(None), current_user: str = Depends(verify_token)):
     conn = get_db_connection(); cur = conn.cursor()
@@ -831,7 +811,6 @@ def decline_request(request_id: Union[int, str], payload: DeclineIn = Body(...),
         cur.close(); conn.close()
 
 # ---------------------- Messaging (PII guard until paid) ----------------------
-
 EMAIL_RE = re.compile(r"[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}", re.I)
 PHONE_RE = re.compile(r"(\+?\d[\d\-\s\(\)]{7,}\d)")
 URL_RE = re.compile(r"(https?://|www\.)", re.I)
@@ -908,7 +887,6 @@ def send_message(payload: MessageSendIn, current_user: str = Depends(verify_toke
         cur.close(); conn.close()
 
 # ---------------------- Stripe ----------------------
-
 @app.post("/stripe/create-onboarding-link")
 def stripe_onboard(current_user: str = Depends(verify_token)):
     if not stripe_ready():
@@ -1038,22 +1016,18 @@ async def stripe_webhook(request: Request):
         if req_id and listing_id and renter_email and lister_email:
             conn = get_db_connection(); cur = conn.cursor()
             try:
-                # mark paid
                 cur.execute("UPDATE rental_requests SET status='paid', updated_at=NOW() WHERE id=%s", (str(req_id),))
-                # unlock thread
                 cur.execute("""
                     UPDATE message_threads
                        SET is_unlocked=TRUE
                      WHERE listing_id=%s AND renter_email=%s AND lister_email=%s
                 """, (str(listing_id), renter_email, lister_email))
-                # system message
                 cur.execute("""
                     INSERT INTO messages (thread_id, sender_email, body, created_at, system)
                     SELECT id, %s, %s, NOW(), TRUE
                       FROM message_threads
                      WHERE listing_id=%s AND renter_email=%s AND lister_email=%s
                 """, ("system@rentonomic", "Payment confirmed. Messaging unlocked.", str(listing_id), renter_email, lister_email))
-                # rentals row (idempotent)
                 cur.execute("""
                     INSERT INTO rentals (request_id, listing_id, renter_email, lister_email,
                                          start_date, end_date, amount_base_pence, amount_renter_pence, platform_fee_pence)
@@ -1068,7 +1042,6 @@ async def stripe_webhook(request: Request):
                 try: cur.close(); conn.close()
                 except Exception: pass
 
-            # best-effort emails
             try:
                 send_alert_email(renter_email, "Payment received — booking confirmed",
                                  "<p>Your payment was successful. The chat is now unlocked.</p>")
@@ -1079,8 +1052,7 @@ async def stripe_webhook(request: Request):
 
     return {"ok": True}
 
-# ---------------------- Health ----------------------
-
+# ---------------------- Health & Diagnostics ----------------------
 @app.get("/")
 def root():
     return {"ok": True, "service": "rentonomic-api"}
@@ -1096,6 +1068,41 @@ def healthz():
 @app.head("/healthz")
 def healthz_head():
     return Response(status_code=200)
+
+@app.get("/__diag/db")
+def diag_db(current_user: str = Depends(verify_token)):
+    """Admin-only DB connectivity & schema snapshot (safe fields)."""
+    if not is_admin(current_user):
+        raise HTTPException(status_code=403, detail="Admin only")
+    out: Dict[str, Any] = {"database_url_set": bool(DATABASE_URL)}
+    if not DATABASE_URL:
+        return out
+    try:
+        conn = get_db_connection(); cur = conn.cursor(cursor_factory=psycopg2.extras.DictCursor)
+        # What core tables exist?
+        core_tables = ["users","listings","rental_requests","message_threads","messages","rentals","stripe_accounts"]
+        exists_map = {}
+        for t in core_tables:
+            cur.execute("SELECT 1 FROM information_schema.tables WHERE table_schema='public' AND table_name=%s", (t,))
+            exists_map[t] = bool(cur.fetchone())
+        out["tables"] = exists_map
+
+        # Columns of listings (if present)
+        if exists_map.get("listings"):
+            cur.execute("""
+                SELECT column_name FROM information_schema.columns
+                WHERE table_schema='public' AND table_name='listings'
+            """)
+            out["listings_columns"] = [r[0] for r in cur.fetchall()]
+
+        out["db_ok"] = True
+        return out
+    except Exception as e:
+        out["db_ok"] = False
+        out["error"] = str(e)
+        return out
+
+
 
 
 
