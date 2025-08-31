@@ -1027,6 +1027,21 @@ async def stripe_webhook(request: Request):
 @app.get("/")
 def root():
     return {"ok": True, "service": "rentonomic-api"}
+from fastapi import Response
+
+@app.head("/")
+def root_head():
+    # Render’s health check uses HEAD; return 200 so it passes
+    return Response(status_code=200)
+
+@app.get("/healthz")
+def healthz():
+    return {"ok": True}
+
+@app.head("/healthz")
+def healthz_head():
+    return Response(status_code=200)
+
 
 
 
