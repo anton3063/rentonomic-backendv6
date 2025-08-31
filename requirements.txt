@@ -10,6 +10,7 @@ requests
 python-jose[cryptography]
 sendgrid
 stripe
+email-validator
 
 
 
@@ -25,6 +26,7 @@ stripe
 
 
               
+
 
 
 
