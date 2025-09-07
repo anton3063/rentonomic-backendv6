@@ -9,7 +9,7 @@ import os, re, logging
 from typing import Optional, Union, Dict, Any, List
 from datetime import datetime, timedelta, date
 
-from fastapi import FastAPI, Depends, HTTPException, Body, Form, Request, Header, Query, Response
+from fastapi import FastAPI, Depends, HTTPException, Body, Form, Request, Header, Query, Response, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, EmailStr
 import bcrypt
@@ -343,6 +343,45 @@ def require_lister_ready_for_payments(lister_email: str) -> Optional[str]:
         return link.url
     return None
 
+# ---------------------- Optional Image Storage ----------------------
+def store_image_and_get_url(image: Optional[UploadFile]) -> Optional[str]:
+    """
+    Best-effort upload. Tries Cloudinary (CLOUDINARY_URL), then AWS S3 (AWS_S3_BUCKET).
+    Returns a public URL or None if storage isn’t configured/available.
+    """
+    if not image:
+        return None
+
+    # Try Cloudinary
+    try:
+        import cloudinary
+        import cloudinary.uploader as cu
+        cloudinary.config(cloudinary_url=os.environ.get("CLOUDINARY_URL"))
+        res = cu.upload(image.file, folder="rentonomic/listings")
+        url = res.get("secure_url") or res.get("url")
+        if url:
+            return url
+    except Exception:
+        pass
+
+    # Try S3
+    try:
+        import boto3, uuid
+        bucket = os.environ.get("AWS_S3_BUCKET")
+        if bucket:
+            region = os.environ.get("AWS_REGION", "eu-west-1")
+            key = f"listings/{uuid.uuid4()}_{image.filename or 'image'}"
+            s3 = boto3.client("s3")
+            s3.upload_fileobj(
+                image.file, bucket, key,
+                ExtraArgs={"ACL": "public-read", "ContentType": image.content_type or "application/octet-stream"}
+            )
+            return f"https://{bucket}.s3.{region}.amazonaws.com/{key}"
+    except Exception:
+        pass
+
+    return None
+
 # ---------------------- Models ----------------------
 class SignupIn(BaseModel):
     email: EmailStr
@@ -516,6 +555,108 @@ def my_listings(current_user: str = Depends(verify_token)):
         return fetch_all_dict(cur)
     finally:
         cur.close(); conn.close()
+
+# ---------------------- Owner update/delete (aligns with script.js) ----------------------
+@app.put("/listings/{listing_id}")
+async def owner_update_listing(
+    listing_id: Union[int, str],
+    request: Request,
+    # Accept FormData fields (when multipart) – script may send these
+    name: Optional[str] = Form(None),
+    description: Optional[str] = Form(None),
+    location: Optional[str] = Form(None),
+    price_per_day: Optional[str] = Form(None),
+    image_url: Optional[str] = Form(None),
+    image: Optional[UploadFile] = File(None),  # optional file upload
+    current_user: str = Depends(verify_token),
+):
+    """
+    Owner (or admin) can update listing fields.
+    Supports JSON body (application/json) OR multipart form (with optional 'image' file).
+    If image storage is not configured, we keep the existing image_url.
+    """
+    conn = get_db_connection(); cur = conn.cursor()
+    try:
+        # Ownership check
+        cur.execute("SELECT owner_email FROM listings WHERE id=%s AND deleted_at IS NULL", (str(listing_id),))
+        row = cur.fetchone()
+        if not row:
+            raise HTTPException(status_code=404, detail="Listing not found")
+        if row[0] != current_user and not is_admin(current_user):
+            raise HTTPException(status_code=403, detail="Forbidden")
+
+        # If JSON, merge JSON payload into variables
+        ct = (request.headers.get("content-type") or "").lower()
+        if ct.startswith("application/json"):
+            try:
+                data = await request.json()
+            except Exception:
+                data = {}
+            name         = data.get("name", name)
+            description  = data.get("description", description)
+            location     = data.get("location", location)
+            price_per_day= data.get("price_per_day", price_per_day)
+            image_url    = data.get("image_url", image_url)
+
+        # If a file was provided, attempt upload and set image_url
+        uploaded_url = store_image_and_get_url(image) if image is not None else None
+        if uploaded_url:
+            image_url = uploaded_url  # take precedence over provided image_url
+
+        # Build update
+        fields, values = [], []
+
+        if name is not None:
+            fields.append("name=%s"); values.append(name)
+
+        if description is not None:
+            fields.append("description=%s"); values.append(description)
+
+        if location is not None:
+            fields.append("location=%s"); values.append(outward_prefix(location))
+
+        if price_per_day is not None:
+            try:
+                price_num = float(str(price_per_day).replace(",", ""))
+            except Exception:
+                raise HTTPException(status_code=400, detail="Invalid price")
+            fields.append("price_per_day=%s"); values.append(price_num)
+
+        if image_url is not None:
+            fields.append("image_url=%s"); values.append(image_url)
+
+        if not fields:
+            return {"ok": True, "id": str(listing_id), "message": "No changes"}
+
+        values.append(str(listing_id))
+        cur.execute(f"UPDATE listings SET {', '.join(fields)} WHERE id=%s", values)
+        conn.commit()
+        return {"ok": True, "id": str(listing_id), "updated_fields": [f.split('=')[0] for f in fields]}
+    finally:
+        try: cur.close(); conn.close()
+        except Exception: pass
+
+
+@app.delete("/listings/{listing_id}")
+def owner_delete_listing(listing_id: Union[int, str], current_user: str = Depends(verify_token)):
+    """
+    Owner (or admin) soft-deletes a listing (sets deleted_at). Matches script.js expectation.
+    """
+    conn = get_db_connection(); cur = conn.cursor()
+    try:
+        cur.execute("SELECT owner_email FROM listings WHERE id=%s AND deleted_at IS NULL", (str(listing_id),))
+        row = cur.fetchone()
+        if not row:
+            raise HTTPException(status_code=404, detail="Listing not found or already deleted")
+        if row[0] != current_user and not is_admin(current_user):
+            raise HTTPException(status_code=403, detail="Forbidden")
+
+        cur.execute("UPDATE listings SET deleted_at=NOW() WHERE id=%s", (str(listing_id),))
+        conn.commit()
+        return {"ok": True, "soft_deleted": str(listing_id)}
+    finally:
+        try: cur.close(); conn.close()
+        except Exception: pass
 
 # ---------------------- Admin moderation + listing fetch ----------------------
 @app.post("/admin/listings/{listing_id}/soft-delete")
@@ -1101,6 +1242,8 @@ def diag_db(current_user: str = Depends(verify_token)):
         out["db_ok"] = False
         out["error"] = str(e)
         return out
+
+
 
 
 
