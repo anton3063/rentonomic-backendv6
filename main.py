@@ -1,8 +1,9 @@
 # main.py — Rentonomic (FastAPI) — production build (fault-tolerant startup)
 # ----------------------------------------------------------------------------------------
 # Same features as before (auth, listings, requests, messaging, Stripe, email, CORS)
-# PLUS: startup won’t crash if DB/schema is off. Problems are logged and can be
-# inspected via GET /__diag/db (admin-only).
+# PLUS:
+# - Robust image upload helper (Cloudinary first, S3 fallback) with file-pointer rewind
+# - Cloudinary diagnostics endpoints (admin-only): /__diag/cloudinary, /__diag/cloudinary-upload
 # ----------------------------------------------------------------------------------------
 
 import os, re, logging
@@ -348,21 +349,34 @@ def store_image_and_get_url(image: Optional[UploadFile]) -> Optional[str]:
     """
     Best-effort upload. Tries Cloudinary (CLOUDINARY_URL), then AWS S3 (AWS_S3_BUCKET).
     Returns a public URL or None if storage isn’t configured/available.
+    Ensures file pointer is rewound between attempts.
     """
     if not image:
         return None
+
+    # Remember pointer to rewind on fallback
+    try:
+        start_pos = image.file.tell()
+    except Exception:
+        start_pos = None
 
     # Try Cloudinary
     try:
         import cloudinary
         import cloudinary.uploader as cu
-        cloudinary.config(cloudinary_url=os.environ.get("CLOUDINARY_URL"))
-        res = cu.upload(image.file, folder="rentonomic/listings")
+        cloudinary.config(cloudinary_url=os.environ.get("CLOUDINARY_URL"), secure=True)
+        folder = os.environ.get("CLOUDINARY_FOLDER", "rentonomic/listings")
+        res = cu.upload(image.file, folder=folder)
         url = res.get("secure_url") or res.get("url")
         if url:
             return url
-    except Exception:
-        pass
+    except Exception as e:
+        log.warning("Cloudinary upload failed: %s", e)
+        try:
+            if start_pos is not None:
+                image.file.seek(start_pos)
+        except Exception:
+            pass
 
     # Try S3
     try:
@@ -370,15 +384,19 @@ def store_image_and_get_url(image: Optional[UploadFile]) -> Optional[str]:
         bucket = os.environ.get("AWS_S3_BUCKET")
         if bucket:
             region = os.environ.get("AWS_REGION", "eu-west-1")
-            key = f"listings/{uuid.uuid4()}_{image.filename or 'image'}"
+            key = f"listings/{uuid.uuid4()}_{(image.filename or 'image').replace(' ', '_')}"
+            try:
+                image.file.seek(0)
+            except Exception:
+                pass
             s3 = boto3.client("s3")
             s3.upload_fileobj(
                 image.file, bucket, key,
                 ExtraArgs={"ACL": "public-read", "ContentType": image.content_type or "application/octet-stream"}
             )
             return f"https://{bucket}.s3.{region}.amazonaws.com/{key}"
-    except Exception:
-        pass
+    except Exception as e:
+        log.warning("S3 upload failed: %s", e)
 
     return None
 
@@ -561,13 +579,12 @@ def my_listings(current_user: str = Depends(verify_token)):
 async def owner_update_listing(
     listing_id: Union[int, str],
     request: Request,
-    # Accept FormData fields (when multipart) – script may send these
     name: Optional[str] = Form(None),
     description: Optional[str] = Form(None),
     location: Optional[str] = Form(None),
     price_per_day: Optional[str] = Form(None),
     image_url: Optional[str] = Form(None),
-    image: Optional[UploadFile] = File(None),  # optional file upload
+    image: Optional[UploadFile] = File(None),
     current_user: str = Depends(verify_token),
 ):
     """
@@ -605,23 +622,18 @@ async def owner_update_listing(
 
         # Build update
         fields, values = [], []
-
         if name is not None:
             fields.append("name=%s"); values.append(name)
-
         if description is not None:
             fields.append("description=%s"); values.append(description)
-
         if location is not None:
             fields.append("location=%s"); values.append(outward_prefix(location))
-
         if price_per_day is not None:
             try:
                 price_num = float(str(price_per_day).replace(",", ""))
             except Exception:
                 raise HTTPException(status_code=400, detail="Invalid price")
             fields.append("price_per_day=%s"); values.append(price_num)
-
         if image_url is not None:
             fields.append("image_url=%s"); values.append(image_url)
 
@@ -635,7 +647,6 @@ async def owner_update_listing(
     finally:
         try: cur.close(); conn.close()
         except Exception: pass
-
 
 @app.delete("/listings/{listing_id}")
 def owner_delete_listing(listing_id: Union[int, str], current_user: str = Depends(verify_token)):
@@ -1193,7 +1204,7 @@ async def stripe_webhook(request: Request):
 
     return {"ok": True}
 
-# ---------------------- Health & Diagnostics ----------------------
+# ---------------------- Diagnostics ----------------------
 @app.get("/")
 def root():
     return {"ok": True, "service": "rentonomic-api"}
@@ -1220,7 +1231,6 @@ def diag_db(current_user: str = Depends(verify_token)):
         return out
     try:
         conn = get_db_connection(); cur = conn.cursor(cursor_factory=psycopg2.extras.DictCursor)
-        # What core tables exist?
         core_tables = ["users","listings","rental_requests","message_threads","messages","rentals","stripe_accounts"]
         exists_map = {}
         for t in core_tables:
@@ -1228,7 +1238,6 @@ def diag_db(current_user: str = Depends(verify_token)):
             exists_map[t] = bool(cur.fetchone())
         out["tables"] = exists_map
 
-        # Columns of listings (if present)
         if exists_map.get("listings"):
             cur.execute("""
                 SELECT column_name FROM information_schema.columns
@@ -1242,6 +1251,56 @@ def diag_db(current_user: str = Depends(verify_token)):
         out["db_ok"] = False
         out["error"] = str(e)
         return out
+
+@app.get("/__diag/cloudinary")
+def diag_cloudinary(current_user: str = Depends(verify_token)):
+    """Admin-only: verify Cloudinary package/env and attempt admin API ping."""
+    if not is_admin(current_user):
+        raise HTTPException(status_code=403, detail="Admin only")
+    out: Dict[str, Any] = {
+        "has_package": False,
+        "has_env": bool(os.environ.get("CLOUDINARY_URL")),
+        "ok": False,
+    }
+    try:
+        import cloudinary
+        import cloudinary.api as ca
+        out["has_package"] = True
+        cloudinary.config(cloudinary_url=os.environ.get("CLOUDINARY_URL"), secure=True)
+        try:
+            ping = ca.ping()
+            out["api_ping"] = ping
+            out["ok"] = True
+        except Exception as e:
+            out["error"] = str(e)
+    except Exception as e:
+        out["error"] = str(e)
+    return out
+
+@app.post("/__diag/cloudinary-upload")
+def diag_cloudinary_upload(
+    run: int = Query(0, ge=0, le=1),
+    current_user: str = Depends(verify_token)
+):
+    """Admin-only: optional tiny 1x1 PNG upload to confirm end-to-end Cloudinary upload."""
+    if not is_admin(current_user):
+        raise HTTPException(status_code=403, detail="Admin only")
+    if run != 1:
+        return {"ok": True, "hint": "Pass ?run=1 to perform a tiny test upload (1x1 PNG)."}
+    try:
+        import io, base64, time
+        import cloudinary
+        import cloudinary.uploader as cu
+        cloudinary.config(cloudinary_url=os.environ.get("CLOUDINARY_URL"), secure=True)
+        tiny_png = base64.b64decode("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR4nGNgYAAAAAMAASsJTYQAAAAASUVORK5CYII=")
+        buf = io.BytesIO(tiny_png)
+        res = cu.upload(buf, folder=os.environ.get("CLOUDINARY_FOLDER", "rentonomic/diag"), public_id=f"healthcheck-{int(time.time())}")
+        url = res.get("secure_url") or res.get("url")
+        return {"ok": True, "url": url}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 
 
 
