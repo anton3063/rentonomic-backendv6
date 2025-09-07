@@ -1,406 +1,187 @@
-# main.py — Rentonomic (FastAPI) — production build (fault-tolerant startup)
-# ----------------------------------------------------------------------------------------
-# Same features as before (auth, listings, requests, messaging, Stripe, email, CORS)
-# PLUS:
-# - Robust image upload helper (Cloudinary first, S3 fallback) with file-pointer rewind
-# - Cloudinary diagnostics endpoints (admin-only): /__diag/cloudinary, /__diag/cloudinary-upload
-# ----------------------------------------------------------------------------------------
+import os
+import json
+import uuid
+import base64
+import hashlib
+import logging
+from datetime import datetime, timedelta
+from typing import Optional, Any, Dict
 
-import os, re, logging
-from typing import Optional, Union, Dict, Any, List
-from datetime import datetime, timedelta, date
-
-from fastapi import FastAPI, Depends, HTTPException, Body, Form, Request, Header, Query, Response, UploadFile, File
-from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel, EmailStr
-import bcrypt
-import jwt  # PyJWT
 import psycopg2
 import psycopg2.extras
+from fastapi import FastAPI, Depends, HTTPException, UploadFile, File, Form, Header, Request
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse, PlainTextResponse
+from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
+from pydantic import BaseModel, EmailStr
+import jwt
 
-# SendGrid (optional)
-try:
-    from sendgrid import SendGridAPIClient
-    from sendgrid.helpers.mail import Mail
-except Exception:
-    SendGridAPIClient = None
-    Mail = None
+# Cloudinary
+import cloudinary
+import cloudinary.uploader as cu
 
-# Stripe (optional)
-try:
-    import stripe as stripe_sdk
-except Exception:
-    stripe_sdk = None
+# SendGrid
+from sendgrid import SendGridAPIClient
+from sendgrid.helpers.mail import Mail
 
-# ---------------------- Logging ----------------------
-LOG_LEVEL = os.environ.get("LOG_LEVEL", "INFO").upper()
-logging.basicConfig(level=LOG_LEVEL)
-log = logging.getLogger("rentonomic")
+# Stripe
+import stripe
 
-# ---------------------- Config ----------------------
-DATABASE_URL = os.environ.get("DATABASE_URL", "")
-JWT_SECRET = os.environ.get("JWT_SECRET", "change-me")
-JWT_ALG = "HS256"
+# -----------------------------------------------------------------------------
+# Environment
+# -----------------------------------------------------------------------------
+DATABASE_URL = os.getenv("DATABASE_URL")  # postgresql://...
+JWT_SECRET = os.getenv("JWT_SECRET", "change-me")  # set in environment
+JWT_ALG = os.getenv("JWT_ALG", "HS256")
+JWT_EXP_MIN = int(os.getenv("JWT_EXP_MIN", "43200"))  # 30 days
 
-ADMIN_EMAILS = {os.environ.get("ADMIN_EMAIL", "admin@rentonomic.com").lower()}
-ALERT_FROM_EMAIL = os.environ.get("ALERT_FROM_EMAIL", "alert@rentonomic.com")
-SENDGRID_API_KEY = os.environ.get("SENDGRID_API_KEY", "")
+SENDGRID_API_KEY = os.getenv("SENDGRID_API_KEY")
+SENDGRID_FROM = os.getenv("SENDGRID_FROM", "alert@rentonomic.com")
 
-STRIPE_SECRET_KEY = os.environ.get("STRIPE_SECRET_KEY", "")
-STRIPE_WEBHOOK_SECRET = os.environ.get("STRIPE_WEBHOOK_SECRET", "")
-FRONTEND_BASE = os.environ.get("FRONTEND_BASE", "https://rentonomic.com")
+CLOUDINARY_URL = os.getenv("CLOUDINARY_URL")
+if CLOUDINARY_URL:
+    cloudinary.config(cloudinary_url=CLOUDINARY_URL)
 
-PLATFORM_FEE_RATE = 0.10  # 10%
+STRIPE_SECRET_KEY = os.getenv("STRIPE_SECRET_KEY")  # live or test
+STRIPE_WEBHOOK_SECRET = os.getenv("STRIPE_WEBHOOK_SECRET")  # live or test
+FRONTEND_URL = os.getenv("FRONTEND_URL", "https://rentonomic.netlify.app")  # adjust to your domain
+CURRENCY = os.getenv("CURRENCY", "gbp")  # "gbp" default
+PLATFORM_FEE_PERCENT = float(os.getenv("PLATFORM_FEE_PERCENT", "10"))  # 10% default
 
-# If true, migrations that fail will be logged and ignored (service still starts).
-SOFT_STARTUP = os.environ.get("SOFT_STARTUP", "1") != "0"
+if STRIPE_SECRET_KEY:
+    stripe.api_key = STRIPE_SECRET_KEY
 
-app = FastAPI(title="Rentonomic API")
-
-# ---------------------- CORS ----------------------
-ALLOWED_ORIGINS = [
-    "https://rentonomic.com",
-    "https://www.rentonomic.com",
-    "https://rentonomic.netlify.app",
-    "http://localhost",
-    "http://localhost:5173",
-]
+# -----------------------------------------------------------------------------
+# App & CORS
+# -----------------------------------------------------------------------------
+app = FastAPI(title="Rentonomic API", version="9.1")
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=ALLOWED_ORIGINS,
+    allow_origins=["*"],  # tighten to your domains when ready
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
+security = HTTPBearer()
 
-# ---------------------- DB helpers ----------------------
-def get_db_connection():
-    if not DATABASE_URL:
-        raise RuntimeError("DATABASE_URL not set")
-    return psycopg2.connect(DATABASE_URL, sslmode="require")
+# -----------------------------------------------------------------------------
+# DB
+# -----------------------------------------------------------------------------
+def db_conn():
+    return psycopg2.connect(DATABASE_URL, cursor_factory=psycopg2.extras.RealDictCursor)
 
-def fetch_all_dict(cur) -> List[Dict[str, Any]]:
-    try:
-        rows = cur.fetchall()
-    except Exception:
-        return []
-    return [{desc.name: val for desc, val in zip(cur.description, r)} for r in rows]
-
-def fetch_one_dict(cur) -> Optional[Dict[str, Any]]:
-    r = cur.fetchone()
-    if r is None:
-        return None
-    return {desc.name: val for desc, val in zip(cur.description, r)}
-
-def table_exists(cur, table: str) -> bool:
-    cur.execute(
-        "SELECT 1 FROM information_schema.tables WHERE table_schema='public' AND table_name=%s",
-        (table,),
-    )
-    return cur.fetchone() is not None
-
-def column_exists(cur, table: str, column: str) -> bool:
-    cur.execute(
-        "SELECT 1 FROM information_schema.columns WHERE table_schema='public' AND table_name=%s AND column_name=%s",
-        (table, column),
-    )
-    return cur.fetchone() is not None
-
-def ensure_aux_tables():
-    conn = get_db_connection(); cur = conn.cursor()
-    try:
+def run_migrations():
+    with db_conn() as conn, conn.cursor() as cur:
+        # users
         cur.execute("""
-            CREATE TABLE IF NOT EXISTS stripe_accounts (
-                email TEXT PRIMARY KEY,
-                account_id TEXT NOT NULL,
-                created_at TIMESTAMP NOT NULL DEFAULT NOW()
-            )
+        CREATE TABLE IF NOT EXISTS users (
+            id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+            email TEXT UNIQUE NOT NULL,
+            password_hash TEXT NOT NULL,
+            stripe_account_id TEXT,
+            created_at TIMESTAMP NOT NULL DEFAULT NOW()
+        );
         """)
-        cur.execute("""
-            CREATE TABLE IF NOT EXISTS rentals (
-                id SERIAL PRIMARY KEY,
-                request_id TEXT NOT NULL UNIQUE,
-                listing_id TEXT NOT NULL,
-                renter_email TEXT NOT NULL,
-                lister_email TEXT NOT NULL,
-                start_date DATE NOT NULL,
-                end_date DATE NOT NULL,
-                amount_base_pence INTEGER NOT NULL,
-                amount_renter_pence INTEGER NOT NULL,
-                platform_fee_pence INTEGER NOT NULL,
-                created_at TIMESTAMP NOT NULL DEFAULT NOW()
-            )
-        """)
-        # messages.system flag
-        if table_exists(cur, "messages") and not column_exists(cur, "messages", "system"):
-            cur.execute("ALTER TABLE messages ADD COLUMN IF NOT EXISTS system BOOLEAN DEFAULT FALSE")
-        # Indexes
-        cur.execute("CREATE INDEX IF NOT EXISTS idx_rentals_listing ON rentals(listing_id)")
-        if table_exists(cur, "messages"):
-            cur.execute("CREATE INDEX IF NOT EXISTS idx_messages_thread ON messages(thread_id)")
-        conn.commit()
-        log.info("Aux tables ensured")
-    finally:
-        try: cur.close(); conn.close()
-        except Exception: pass
-
-def ensure_core_columns_and_indexes():
-    conn = get_db_connection(); cur = conn.cursor()
-    try:
         # listings
-        if table_exists(cur, "listings"):
-            if not column_exists(cur, "listings", "owner_email"):
-                cur.execute("ALTER TABLE listings ADD COLUMN owner_email TEXT")
-            if not column_exists(cur, "listings", "created_at"):
-                cur.execute("ALTER TABLE listings ADD COLUMN created_at TIMESTAMP")
-            if not column_exists(cur, "listings", "deleted_at"):
-                cur.execute("ALTER TABLE listings ADD COLUMN deleted_at TIMESTAMP NULL")
-
-            # Conditional backfill
-            if column_exists(cur, "listings", "email"):
-                cur.execute("""
-                    UPDATE listings SET owner_email = email
-                     WHERE owner_email IS NULL AND email IS NOT NULL
-                """)
-            if column_exists(cur, "listings", "user_email"):
-                cur.execute("""
-                    UPDATE listings SET owner_email = user_email
-                     WHERE owner_email IS NULL AND user_email IS NOT NULL
-                """)
-            cur.execute("UPDATE listings SET created_at = COALESCE(created_at, NOW()) WHERE created_at IS NULL")
-            cur.execute("CREATE INDEX IF NOT EXISTS idx_listings_owner_email ON listings(owner_email)")
-            cur.execute("CREATE INDEX IF NOT EXISTS idx_listings_deleted ON listings(deleted_at)")
-
-        # rental_requests
-        if table_exists(cur, "rental_requests"):
-            if not column_exists(cur, "rental_requests", "status"):
-                cur.execute("ALTER TABLE rental_requests ADD COLUMN status TEXT")
-            if not column_exists(cur, "rental_requests", "request_time"):
-                cur.execute("ALTER TABLE rental_requests ADD COLUMN request_time TIMESTAMP")
-            if not column_exists(cur, "rental_requests", "updated_at"):
-                cur.execute("ALTER TABLE rental_requests ADD COLUMN updated_at TIMESTAMP")
-            cur.execute("UPDATE rental_requests SET status = COALESCE(status, 'requested')")
-            cur.execute("UPDATE rental_requests SET request_time = COALESCE(request_time, NOW())")
-            cur.execute("CREATE INDEX IF NOT EXISTS idx_rr_lister ON rental_requests(lister_email)")
-            cur.execute("CREATE INDEX IF NOT EXISTS idx_rr_renter ON rental_requests(renter_email)")
-            cur.execute("CREATE INDEX IF NOT EXISTS idx_rr_listing ON rental_requests(listing_id)")
-
-        # message_threads
-        if table_exists(cur, "message_threads"):
-            if not column_exists(cur, "message_threads", "is_unlocked"):
-                cur.execute("ALTER TABLE message_threads ADD COLUMN is_unlocked BOOLEAN")
-            if not column_exists(cur, "message_threads", "created_at"):
-                cur.execute("ALTER TABLE message_threads ADD COLUMN created_at TIMESTAMP")
-            cur.execute("UPDATE message_threads SET is_unlocked = COALESCE(is_unlocked, FALSE)")
-            cur.execute("UPDATE message_threads SET created_at = COALESCE(created_at, NOW())")
-            cur.execute("""
-                DO $$
-                BEGIN
-                  IF NOT EXISTS (
-                    SELECT 1 FROM pg_indexes WHERE indexname = 'idx_message_threads_unique_triplet'
-                  ) THEN
-                    CREATE UNIQUE INDEX idx_message_threads_unique_triplet
-                      ON message_threads(listing_id, renter_email, lister_email);
-                  END IF;
-                END$$
-            """)
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS listings (
+            id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+            name TEXT,
+            location TEXT,
+            description TEXT,
+            price_per_day INTEGER,
+            image_url TEXT,
+            owner_id UUID,
+            owner_email TEXT,
+            created_at TIMESTAMP NOT NULL DEFAULT NOW()
+        );
+        """)
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_listings_owner_id ON listings(owner_id);")
+        # rentals (created on checkout, finalized on webhook)
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS rentals (
+            id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+            listing_id UUID NOT NULL,
+            renter_id UUID NOT NULL,
+            renter_email TEXT NOT NULL,
+            days INTEGER NOT NULL,
+            amount_total INTEGER NOT NULL, -- in minor units (pence)
+            currency TEXT NOT NULL,
+            checkout_session_id TEXT,
+            payment_intent_id TEXT,
+            status TEXT NOT NULL DEFAULT 'pending', -- pending|paid|failed|canceled
+            created_at TIMESTAMP NOT NULL DEFAULT NOW()
+        );
+        """)
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_rentals_renter_id ON rentals(renter_id);")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_rentals_listing_id ON rentals(listing_id);")
         conn.commit()
-        log.info("Core columns/indexes ensured")
-    finally:
-        try: cur.close(); conn.close()
-        except Exception: pass
 
-def _prune_legacy_delete_route():
-    new_routes = []
-    for r in app.router.routes:
-        path = getattr(r, "path", None)
-        methods = set(getattr(r, "methods", []) or [])
-        ep = getattr(r, "endpoint", None)
-        epname = getattr(ep, "__name__", "") if ep else ""
-        if path == "/delete-listing/{listing_id}" and "DELETE" in methods and epname not in {"delete_listing_fallback", "admin_delete_listing"}:
-            continue
-        new_routes.append(r)
-    app.router.routes = new_routes
+run_migrations()
 
-@app.on_event("startup")
-def _startup():
-    # Fault-tolerant migrations: never crash startup.
-    if not DATABASE_URL:
-        log.warning("DATABASE_URL not set — skipping DB migrations at startup")
-    else:
-        try:
-            ensure_aux_tables()
-        except Exception as e:
-            log.exception("ensure_aux_tables failed: %s", e)
-            if not SOFT_STARTUP: raise
-        try:
-            ensure_core_columns_and_indexes()
-        except Exception as e:
-            log.exception("ensure_core_columns_and_indexes failed: %s", e)
-            if not SOFT_STARTUP: raise
-    try:
-        _prune_legacy_delete_route()
-    except Exception as e:
-        log.exception("Route pruning failed (continuing): %s", e)
-
-# ---------------------- Auth helpers ----------------------
+# -----------------------------------------------------------------------------
+# Utilities
+# -----------------------------------------------------------------------------
 def hash_password(pw: str) -> str:
-    return bcrypt.hashpw(pw.encode("utf-8"), bcrypt.gensalt()).decode("utf-8")
+    salt = os.getenv("PW_SALT", "rentonomic-salt").encode()
+    return base64.b64encode(hashlib.pbkdf2_hmac("sha256", pw.encode(), salt, 120000)).decode()
 
 def verify_password(pw: str, hashed: str) -> bool:
-    try:
-        return bcrypt.checkpw(pw.encode("utf-8"), hashed.encode("utf-8"))
-    except Exception:
-        return False
+    return hash_password(pw) == hashed
 
-def create_access_token(email: str, days: int = 45) -> str:
-    payload = {"sub": email, "exp": datetime.utcnow() + timedelta(days=days)}
+def create_token(sub: str, extra: Dict[str, Any] | None = None) -> str:
+    payload = {
+        "sub": sub,
+        "exp": datetime.utcnow() + timedelta(minutes=JWT_EXP_MIN),
+        "iat": datetime.utcnow(),
+    }
+    if extra:
+        payload.update(extra)
     return jwt.encode(payload, JWT_SECRET, algorithm=JWT_ALG)
 
-def decode_token(token: str) -> str:
+def decode_token(token: str) -> dict:
     try:
-        payload = jwt.decode(token, JWT_SECRET, algorithms=[JWT_ALG])
-        return payload.get("sub") or ""
+        return jwt.decode(token, JWT_SECRET, algorithms=[JWT_ALG])
+    except jwt.ExpiredSignatureError:
+        raise HTTPException(status_code=401, detail="Token expired")
     except Exception:
         raise HTTPException(status_code=401, detail="Invalid token")
 
-def is_admin(email: str) -> bool:
-    return (email or "").lower() in ADMIN_EMAILS
-
-def verify_token(authorization: Optional[str] = Header(None)) -> str:
-    if not authorization or not authorization.lower().startswith("bearer "):
-        raise HTTPException(status_code=401, detail="Missing bearer token")
-    token = authorization.split(" ", 1)[1].strip()
-    return decode_token(token)
-
-def outward_prefix(loc: Optional[str]) -> str:
-    if not loc: return ""
-    first = (loc.split("—")[0]).split("-")[0].split(",")[0].strip().split()
-    return (first[0] if first else "").upper()
-
-# ---------------------- Email (best-effort) ----------------------
-def send_alert_email(to_email: str, subject: str, html: str) -> None:
-    try:
-        if not (to_email and SENDGRID_API_KEY and SendGridAPIClient and Mail):
-            return
-        sg = SendGridAPIClient(SENDGRID_API_KEY)
-        msg = Mail(from_email=ALERT_FROM_EMAIL, to_emails=to_email, subject=subject, html_content=html)
-        sg.send(msg)
-    except Exception:
-        pass
-
-# ---------------------- Stripe helpers ----------------------
-def stripe_ready() -> bool:
-    return bool(stripe_sdk and STRIPE_SECRET_KEY)
-
-def stripe_set_key():
-    if stripe_ready():
-        stripe_sdk.api_key = STRIPE_SECRET_KEY
-
-def get_connect_account_id(email: str) -> Optional[str]:
-    conn = get_db_connection(); cur = conn.cursor()
-    try:
-        cur.execute("SELECT account_id FROM stripe_accounts WHERE email=%s", (email,))
+def get_current_user(creds: HTTPAuthorizationCredentials = Depends(security)):
+    token = creds.credentials
+    data = decode_token(token)
+    email = data.get("sub")
+    if not email:
+        raise HTTPException(status_code=401, detail="Invalid token payload")
+    with db_conn() as conn, conn.cursor() as cur:
+        cur.execute("SELECT id, email, stripe_account_id FROM users WHERE email=%s", (email,))
         row = cur.fetchone()
-        return row[0] if row else None
-    finally:
-        cur.close(); conn.close()
+        if not row:
+            raise HTTPException(status_code=401, detail="User not found")
+        return row
 
-def set_connect_account_id(email: str, account_id: str) -> None:
-    conn = get_db_connection(); cur = conn.cursor()
-    try:
-        cur.execute("""
-            INSERT INTO stripe_accounts (email, account_id)
-            VALUES (%s, %s)
-            ON CONFLICT (email) DO UPDATE SET account_id=EXCLUDED.account_id
-        """, (email, account_id))
-        conn.commit()
-    finally:
-        cur.close(); conn.close()
+def renter_price(base_price: int) -> int:
+    # 10% platform fee added for renter display (round to nearest int)
+    return round(base_price * (1 + PLATFORM_FEE_PERCENT / 100.0))
 
-def require_lister_ready_for_payments(lister_email: str) -> Optional[str]:
-    if not stripe_ready():
-        return None
-    stripe_set_key()
-    acct_id = get_connect_account_id(lister_email)
-    if not acct_id:
-        acct = stripe_sdk.Account.create(type="express", email=lister_email)
-        set_connect_account_id(lister_email, acct.id)
-        link = stripe_sdk.AccountLink.create(
-            account=acct.id,
-            refresh_url=f"{FRONTEND_BASE}/dashboard.html?onboarding=refresh",
-            return_url=f"{FRONTEND_BASE}/dashboard.html?onboarding=return",
-            type="account_onboarding",
-        )
-        return link.url
-    acct = stripe_sdk.Account.retrieve(acct_id)
-    if not (acct.get("charges_enabled") and acct.get("details_submitted")):
-        link = stripe_sdk.AccountLink.create(
-            account=acct_id,
-            refresh_url=f"{FRONTEND_BASE}/dashboard.html?onboarding=refresh",
-            return_url=f"{FRONTEND_BASE}/dashboard.html?onboarding=return",
-            type="account_onboarding",
-        )
-        return link.url
-    return None
+def row_to_listing_public(row: Dict[str, Any]) -> Dict[str, Any]:
+    return {
+        "id": str(row["id"]),
+        "name": row["name"],
+        "location": row["location"],
+        "description": row.get("description") or "",
+        "price_per_day": row["price_per_day"],  # base price (owner)
+        "renter_price_per_day": renter_price(row["price_per_day"]),  # renter sees this
+        "image_url": row.get("image_url") or "",
+        "created_at": row.get("created_at").isoformat() if row.get("created_at") else None,
+    }
 
-# ---------------------- Optional Image Storage ----------------------
-def store_image_and_get_url(image: Optional[UploadFile]) -> Optional[str]:
-    """
-    Best-effort upload. Tries Cloudinary (CLOUDINARY_URL), then AWS S3 (AWS_S3_BUCKET).
-    Returns a public URL or None if storage isn’t configured/available.
-    Ensures file pointer is rewound between attempts.
-    """
-    if not image:
-        return None
+def gbp_to_pence(amount_gbp: float | int) -> int:
+    return int(round(float(amount_gbp) * 100))
 
-    # Remember pointer to rewind on fallback
-    try:
-        start_pos = image.file.tell()
-    except Exception:
-        start_pos = None
-
-    # Try Cloudinary
-    try:
-        import cloudinary
-        import cloudinary.uploader as cu
-        cloudinary.config(cloudinary_url=os.environ.get("CLOUDINARY_URL"), secure=True)
-        folder = os.environ.get("CLOUDINARY_FOLDER", "rentonomic/listings")
-        res = cu.upload(image.file, folder=folder)
-        url = res.get("secure_url") or res.get("url")
-        if url:
-            return url
-    except Exception as e:
-        log.warning("Cloudinary upload failed: %s", e)
-        try:
-            if start_pos is not None:
-                image.file.seek(start_pos)
-        except Exception:
-            pass
-
-    # Try S3
-    try:
-        import boto3, uuid
-        bucket = os.environ.get("AWS_S3_BUCKET")
-        if bucket:
-            region = os.environ.get("AWS_REGION", "eu-west-1")
-            key = f"listings/{uuid.uuid4()}_{(image.filename or 'image').replace(' ', '_')}"
-            try:
-                image.file.seek(0)
-            except Exception:
-                pass
-            s3 = boto3.client("s3")
-            s3.upload_fileobj(
-                image.file, bucket, key,
-                ExtraArgs={"ACL": "public-read", "ContentType": image.content_type or "application/octet-stream"}
-            )
-            return f"https://{bucket}.s3.{region}.amazonaws.com/{key}"
-    except Exception as e:
-        log.warning("S3 upload failed: %s", e)
-
-    return None
-
-# ---------------------- Models ----------------------
+# -----------------------------------------------------------------------------
+# Models
+# -----------------------------------------------------------------------------
 class SignupIn(BaseModel):
     email: EmailStr
     password: str
@@ -409,896 +190,424 @@ class LoginIn(BaseModel):
     email: EmailStr
     password: str
 
-class RequestToRentIn(BaseModel):
-    listing_id: Union[int, str]
-    start_date: date
-    end_date: date
+class EditListingIn(BaseModel):
+    name: Optional[str] = None
+    location: Optional[str] = None
+    description: Optional[str] = None
+    price_per_day: Optional[int] = None
+    image_url: Optional[str] = None
 
-class DeclineIn(BaseModel):
-    reason: Optional[str] = None
+class RentRequestIn(BaseModel):
+    listing_id: uuid.UUID
+    dates: list[str]
+    message: Optional[str] = None
 
-class AcceptIn(BaseModel):
-    note: Optional[str] = None
+class CheckoutIn(BaseModel):
+    listing_id: uuid.UUID
+    dates: list[str]  # the dates/range the renter selected
+    days: int         # number of billable days (>=1)
+    success_url: Optional[str] = None  # optional override
+    cancel_url: Optional[str] = None   # optional override
 
-class CheckoutStartIn(BaseModel):
-    request_id: Union[int, str]
+class OnboardingIn(BaseModel):
+    refresh_url: Optional[str] = None
+    return_url: Optional[str] = None
 
-class MessageSendIn(BaseModel):
-    thread_id: Union[int, str]
-    body: str
+# -----------------------------------------------------------------------------
+# Exception Handlers (friendly errors)
+# -----------------------------------------------------------------------------
+from fastapi.exceptions import RequestValidationError
 
-# ---------------------- Auth routes ----------------------
+@app.exception_handler(RequestValidationError)
+async def validation_handler(request: Request, exc: RequestValidationError):
+    return JSONResponse(status_code=422, content={"error": "Invalid input", "details": exc.errors()})
+
+@app.exception_handler(HTTPException)
+async def http_handler(request: Request, exc: HTTPException):
+    return JSONResponse(status_code=exc.status_code, content={"error": exc.detail})
+
+@app.exception_handler(Exception)
+async def generic_handler(request: Request, exc: Exception):
+    logging.exception("Unhandled error: %s", exc)
+    return JSONResponse(status_code=500, content={"error": "Server error"})
+
+# -----------------------------------------------------------------------------
+# Health
+# -----------------------------------------------------------------------------
+@app.get("/health")
+def health():
+    return {"ok": True, "time": datetime.utcnow().isoformat()}
+
+# -----------------------------------------------------------------------------
+# Auth
+# -----------------------------------------------------------------------------
 @app.post("/signup")
-def signup(payload: SignupIn):
-    email = payload.email.lower()
-    password_hash = hash_password(payload.password)
-    conn = get_db_connection(); cur = conn.cursor()
-    try:
-        cur.execute("SELECT 1 FROM users WHERE email=%s", (email,))
+def signup(body: SignupIn):
+    with db_conn() as conn, conn.cursor() as cur:
+        cur.execute("SELECT 1 FROM users WHERE email=%s", (body.email,))
         if cur.fetchone():
             raise HTTPException(status_code=400, detail="Email already registered")
         cur.execute(
-            "INSERT INTO users (email, password_hash, created_at) VALUES (%s, %s, NOW())",
-            (email, password_hash),
+            "INSERT INTO users (email, password_hash) VALUES (%s, %s) RETURNING id",
+            (body.email, hash_password(body.password)),
         )
         conn.commit()
-        token = create_access_token(email)
-        return {"token": token, "email": email}
-    finally:
-        cur.close(); conn.close()
+    token = create_token(body.email)
+    return {"token": token}
 
 @app.post("/login")
-def login(payload: LoginIn):
-    email = payload.email.lower()
-    conn = get_db_connection(); cur = conn.cursor()
-    try:
-        cur.execute("SELECT password_hash FROM users WHERE email=%s", (email,))
+def login(body: LoginIn):
+    with db_conn() as conn, conn.cursor() as cur:
+        cur.execute("SELECT id, email, password_hash FROM users WHERE email=%s", (body.email,))
         row = cur.fetchone()
-        if not row or not verify_password(payload.password, row[0]):
+        if not row or not verify_password(body.password, row["password_hash"]):
             raise HTTPException(status_code=401, detail="Invalid credentials")
-        token = create_access_token(email)
-        return {"token": token, "email": email}
-    finally:
-        cur.close(); conn.close()
+    token = create_token(body.email)
+    return {"token": token}
 
-# ---------------------- Listings ----------------------
+# -----------------------------------------------------------------------------
+# Listings
+# -----------------------------------------------------------------------------
 @app.get("/listings")
-def get_listings():
-    conn = get_db_connection(); cur = conn.cursor()
-    try:
+def all_listings():
+    with db_conn() as conn, conn.cursor() as cur:
         cur.execute("""
-            SELECT id, name, description, location, image_url,
-                   price_per_day, owner_email, created_at, deleted_at
+            SELECT id, name, location, description, price_per_day, image_url, created_at
             FROM listings
-            WHERE deleted_at IS NULL
             ORDER BY created_at DESC
         """)
-        return fetch_all_dict(cur)
-    finally:
-        cur.close(); conn.close()
+        rows = cur.fetchall()
+    return [row_to_listing_public(r) for r in rows]
 
-@app.get("/listing/{listing_id}")
-def get_listing(listing_id: Union[int, str]):
-    conn = get_db_connection(); cur = conn.cursor()
-    try:
+@app.get("/my-listings")
+def my_listings(current_user: Dict[str, Any] = Depends(get_current_user)):
+    with db_conn() as conn, conn.cursor() as cur:
         cur.execute("""
-            SELECT id, name, description, location, image_url,
-                   price_per_day, owner_email, created_at, deleted_at
+            SELECT id, name, location, description, price_per_day, image_url, owner_email, created_at
             FROM listings
-            WHERE id=%s
-        """, (str(listing_id),))
-        row = fetch_one_dict(cur)
-        if not row or row.get("deleted_at"):
-            raise HTTPException(status_code=404, detail="Listing not found")
-        return row
-    finally:
-        cur.close(); conn.close()
+            WHERE owner_id = %s
+            ORDER BY created_at DESC
+        """, (current_user["id"],))
+        rows = cur.fetchall()
+    return rows
 
 @app.post("/list")
 def create_listing(
     name: str = Form(...),
-    description: Optional[str] = Form(""),
-    location: Optional[str] = Form(""),
-    price_per_day: Union[str, float] = Form(...),
-    image_url: Optional[str] = Form(""),
-    current_user: str = Depends(verify_token),
+    location: str = Form(...),
+    description: str = Form(""),
+    price_per_day: int = Form(...),
+    image: UploadFile | None = File(None),
+    image_url: str | None = Form(None),
+    current_user: Dict[str, Any] = Depends(get_current_user),
 ):
-    loc = outward_prefix(location)
     try:
-        price_num = float(str(price_per_day).replace(",", ""))
-    except Exception:
-        raise HTTPException(status_code=400, detail="Invalid price")
-    conn = get_db_connection(); cur = conn.cursor()
-    try:
-        cur.execute("""
-            INSERT INTO listings (name, description, location, price_per_day, image_url, owner_email, created_at)
-            VALUES (%s, %s, %s, %s, %s, %s, NOW())
-            RETURNING id
-        """, (name, description, loc, price_num, image_url, current_user))
-        new_id = cur.fetchone()[0]
-        conn.commit()
-        return {"ok": True, "id": new_id}
-    finally:
-        cur.close(); conn.close()
+        final_url = None
+        if image is not None:
+            uploaded = cu.upload(image.file, folder="rentonomic/listings")
+            final_url = uploaded.get("secure_url")
+        elif image_url:
+            final_url = image_url
+        else:
+            raise HTTPException(status_code=400, detail="Image or image_url required")
 
-@app.patch("/update-listing/{listing_id}")
-def update_listing(
-    listing_id: Union[int, str],
-    name: Optional[str] = Form(None),
-    description: Optional[str] = Form(None),
-    location: Optional[str] = Form(None),
-    price_per_day: Optional[str] = Form(None),
-    image_url: Optional[str] = Form(None),
-    current_user: str = Depends(verify_token),
-):
-    conn = get_db_connection(); cur = conn.cursor()
-    try:
-        cur.execute("SELECT owner_email FROM listings WHERE id=%s AND deleted_at IS NULL", (str(listing_id),))
-        row = cur.fetchone()
-        if not row:
-            raise HTTPException(status_code=404, detail="Listing not found")
-        if row[0] != current_user and not is_admin(current_user):
-            raise HTTPException(status_code=403, detail="Forbidden")
+        with db_conn() as conn, conn.cursor() as cur:
+            cur.execute("""
+                INSERT INTO listings (name, location, description, price_per_day, image_url, owner_id, owner_email)
+                VALUES (%s, %s, %s, %s, %s, %s, %s)
+                RETURNING id, name, location, description, price_per_day, image_url, owner_email, created_at
+            """, (name, location, description, price_per_day, final_url, current_user["id"], current_user["email"]))
+            row = cur.fetchone()
+            conn.commit()
+        return {"ok": True, "listing": row}
+    except HTTPException:
+        raise
+    except Exception as e:
+        logging.exception("Create listing failed: %s", e)
+        raise HTTPException(status_code=500, detail="Failed to create listing")
 
-        fields, values = [], []
-        if name is not None: fields.append("name=%s"); values.append(name)
-        if description is not None: fields.append("description=%s"); values.append(description)
-        if location is not None: fields.append("location=%s"); values.append(outward_prefix(location))
-        if price_per_day is not None:
-            try: price_num = float(str(price_per_day).replace(",", ""))
-            except Exception: raise HTTPException(status_code=400, detail="Invalid price")
-            fields.append("price_per_day=%s"); values.append(price_num)
-        if image_url is not None: fields.append("image_url=%s"); values.append(image_url)
-        if not fields:
-            return {"ok": True, "id": str(listing_id), "message": "No changes"}
-
-        values.append(str(listing_id))
-        cur.execute(f"UPDATE listings SET {', '.join(fields)} WHERE id=%s", values)
-        conn.commit()
-        return {"ok": True, "id": str(listing_id)}
-    finally:
-        cur.close(); conn.close()
-
-@app.get("/my-listings")
-def my_listings(current_user: str = Depends(verify_token)):
-    conn = get_db_connection(); cur = conn.cursor()
-    try:
-        cur.execute("""
-            SELECT id, name, description, location, image_url,
-                   price_per_day, owner_email, created_at, deleted_at
-            FROM listings
-            WHERE owner_email=%s AND deleted_at IS NULL
-            ORDER BY created_at DESC
-        """, (current_user,))
-        return fetch_all_dict(cur)
-    finally:
-        cur.close(); conn.close()
-
-# ---------------------- Owner update/delete (aligns with script.js) ----------------------
 @app.put("/listings/{listing_id}")
-async def owner_update_listing(
-    listing_id: Union[int, str],
-    request: Request,
-    name: Optional[str] = Form(None),
-    description: Optional[str] = Form(None),
-    location: Optional[str] = Form(None),
-    price_per_day: Optional[str] = Form(None),
-    image_url: Optional[str] = Form(None),
-    image: Optional[UploadFile] = File(None),
-    current_user: str = Depends(verify_token),
+def update_listing(
+    listing_id: uuid.UUID,
+    body: EditListingIn,
+    current_user: Dict[str, Any] = Depends(get_current_user),
 ):
-    """
-    Owner (or admin) can update listing fields.
-    Supports JSON body (application/json) OR multipart form (with optional 'image' file).
-    If image storage is not configured, we keep the existing image_url.
-    """
-    conn = get_db_connection(); cur = conn.cursor()
-    try:
-        # Ownership check
-        cur.execute("SELECT owner_email FROM listings WHERE id=%s AND deleted_at IS NULL", (str(listing_id),))
+    fields = []
+    vals = []
+    for key in ["name", "location", "description", "price_per_day", "image_url"]:
+        val = getattr(body, key)
+        if val is not None:
+            fields.append(f"{key}=%s")
+            vals.append(val)
+    if not fields:
+        raise HTTPException(status_code=400, detail="No fields to update")
+
+    vals.extend([str(listing_id), current_user["id"]])
+    with db_conn() as conn, conn.cursor() as cur:
+        cur.execute(f"""
+            UPDATE listings
+            SET {", ".join(fields)}
+            WHERE id=%s AND owner_id=%s
+            RETURNING id, name, location, description, price_per_day, image_url, owner_email, created_at
+        """, tuple(vals))
         row = cur.fetchone()
         if not row:
-            raise HTTPException(status_code=404, detail="Listing not found")
-        if row[0] != current_user and not is_admin(current_user):
-            raise HTTPException(status_code=403, detail="Forbidden")
-
-        # If JSON, merge JSON payload into variables
-        ct = (request.headers.get("content-type") or "").lower()
-        if ct.startswith("application/json"):
-            try:
-                data = await request.json()
-            except Exception:
-                data = {}
-            name         = data.get("name", name)
-            description  = data.get("description", description)
-            location     = data.get("location", location)
-            price_per_day= data.get("price_per_day", price_per_day)
-            image_url    = data.get("image_url", image_url)
-
-        # If a file was provided, attempt upload and set image_url
-        uploaded_url = store_image_and_get_url(image) if image is not None else None
-        if uploaded_url:
-            image_url = uploaded_url  # take precedence over provided image_url
-
-        # Build update
-        fields, values = [], []
-        if name is not None:
-            fields.append("name=%s"); values.append(name)
-        if description is not None:
-            fields.append("description=%s"); values.append(description)
-        if location is not None:
-            fields.append("location=%s"); values.append(outward_prefix(location))
-        if price_per_day is not None:
-            try:
-                price_num = float(str(price_per_day).replace(",", ""))
-            except Exception:
-                raise HTTPException(status_code=400, detail="Invalid price")
-            fields.append("price_per_day=%s"); values.append(price_num)
-        if image_url is not None:
-            fields.append("image_url=%s"); values.append(image_url)
-
-        if not fields:
-            return {"ok": True, "id": str(listing_id), "message": "No changes"}
-
-        values.append(str(listing_id))
-        cur.execute(f"UPDATE listings SET {', '.join(fields)} WHERE id=%s", values)
+            raise HTTPException(status_code=404, detail="Listing not found or not owned by user")
         conn.commit()
-        return {"ok": True, "id": str(listing_id), "updated_fields": [f.split('=')[0] for f in fields]}
-    finally:
-        try: cur.close(); conn.close()
-        except Exception: pass
+    return {"ok": True, "listing": row}
 
 @app.delete("/listings/{listing_id}")
-def owner_delete_listing(listing_id: Union[int, str], current_user: str = Depends(verify_token)):
-    """
-    Owner (or admin) soft-deletes a listing (sets deleted_at). Matches script.js expectation.
-    """
-    conn = get_db_connection(); cur = conn.cursor()
-    try:
-        cur.execute("SELECT owner_email FROM listings WHERE id=%s AND deleted_at IS NULL", (str(listing_id),))
+def delete_listing(listing_id: uuid.UUID, current_user: Dict[str, Any] = Depends(get_current_user)):
+    with db_conn() as conn, conn.cursor() as cur:
+        cur.execute("DELETE FROM listings WHERE id=%s AND owner_id=%s RETURNING id", (str(listing_id), current_user["id"]))
         row = cur.fetchone()
         if not row:
-            raise HTTPException(status_code=404, detail="Listing not found or already deleted")
-        if row[0] != current_user and not is_admin(current_user):
-            raise HTTPException(status_code=403, detail="Forbidden")
-
-        cur.execute("UPDATE listings SET deleted_at=NOW() WHERE id=%s", (str(listing_id),))
+            raise HTTPException(status_code=404, detail="Listing not found or not owned by user")
         conn.commit()
-        return {"ok": True, "soft_deleted": str(listing_id)}
-    finally:
-        try: cur.close(); conn.close()
-        except Exception: pass
+    return {"ok": True}
 
-# ---------------------- Admin moderation + listing fetch ----------------------
-@app.post("/admin/listings/{listing_id}/soft-delete")
-def admin_soft_delete_listing(listing_id: Union[int, str], current_user: str = Depends(verify_token)):
-    if not is_admin(current_user):
-        raise HTTPException(status_code=403, detail="Admin only")
-    conn = get_db_connection(); cur = conn.cursor()
-    try:
-        cur.execute("UPDATE listings SET deleted_at=NOW() WHERE id=%s", (str(listing_id),))
-        if cur.rowcount == 0:
-            raise HTTPException(status_code=404, detail="Listing not found")
-        conn.commit()
-        return {"ok": True, "soft_deleted": str(listing_id)}
-    finally:
-        cur.close(); conn.close()
-
-@app.post("/admin/listings/{listing_id}/restore")
-def admin_restore_listing(listing_id: Union[int, str], current_user: str = Depends(verify_token)):
-    if not is_admin(current_user):
-        raise HTTPException(status_code=403, detail="Admin only")
-    conn = get_db_connection(); cur = conn.cursor()
-    try:
-        cur.execute("UPDATE listings SET deleted_at=NULL WHERE id=%s", (str(listing_id),))
-        if cur.rowcount == 0:
-            raise HTTPException(status_code=404, detail="Listing not found")
-        conn.commit()
-        return {"ok": True, "restored": str(listing_id)}
-    finally:
-        cur.close(); conn.close()
-
-@app.delete("/admin/listings/{listing_id}")
-def admin_delete_listing(listing_id: Union[int, str], current_user: str = Depends(verify_token)):
-    if not is_admin(current_user):
-        raise HTTPException(status_code=403, detail="Admin only")
-    conn = get_db_connection(); cur = conn.cursor()
-    try:
-        cur.execute("SELECT id, name, owner_email FROM listings WHERE id=%s", (str(listing_id),))
-        row = fetch_one_dict(cur)
-        if not row:
-            raise HTTPException(status_code=404, detail="Listing not found")
-        owner_email = row.get("owner_email",""); name = row.get("name","")
-
-        cur.execute("DELETE FROM messages WHERE thread_id IN (SELECT id FROM message_threads WHERE listing_id=%s)", (str(listing_id),))
-        cur.execute("DELETE FROM message_threads WHERE listing_id=%s", (str(listing_id),))
-        cur.execute("DELETE FROM rental_requests WHERE listing_id=%s", (str(listing_id),))
-        cur.execute("DELETE FROM rentals WHERE listing_id=%s", (str(listing_id),))
-        cur.execute("DELETE FROM listings WHERE id=%s", (str(listing_id),))
-        conn.commit()
-
-        if owner_email:
-            send_alert_email(owner_email, "Listing removed by moderator",
-                             f"<p>Your listing <strong>{name}</strong> was removed for violating our guidelines.</p>")
-        return {"ok": True, "deleted_listing_id": str(listing_id)}
-    finally:
-        cur.close(); conn.close()
-
-@app.delete("/delete-listing/{listing_id}")
-def delete_listing_fallback(listing_id: Union[int, str], current_user: str = Depends(verify_token)):
-    if not is_admin(current_user):
-        raise HTTPException(status_code=403, detail="Admin only")
-    return admin_delete_listing(listing_id, current_user)
-
-@app.get("/admin/listings")
-def admin_listings(
-    include_deleted: bool = Query(False),
-    owner: Optional[str] = Query(None),
-    q: Optional[str] = Query(None, description="search by name/location"),
-    limit: int = Query(500, ge=1, le=2000),
-    offset: int = Query(0, ge=0),
-    current_user: str = Depends(verify_token),
-):
-    if not is_admin(current_user):
-        raise HTTPException(status_code=403, detail="Admin only")
-    conn = get_db_connection(); cur = conn.cursor()
-    try:
-        where = []
-        params: List[Any] = []
-        if not include_deleted:
-            where.append("deleted_at IS NULL")
-        if owner:
-            where.append("owner_email=%s"); params.append(owner.lower())
-        if q:
-            where.append("(name ILIKE %s OR location ILIKE %s)")
-            params.extend([f"%{q}%", f"%{q}%"])
-        where_sql = ("WHERE " + " AND ".join(where)) if where else ""
-        cur.execute(f"""
-            SELECT id, name, description, location, image_url,
-                   price_per_day, owner_email, created_at, deleted_at
-            FROM listings
-            {where_sql}
-            ORDER BY COALESCE(deleted_at, created_at) DESC
-            LIMIT %s OFFSET %s
-        """, (*params, limit, offset))
-        return fetch_all_dict(cur)
-    finally:
-        cur.close(); conn.close()
-
-# ---------------------- Rental Requests ----------------------
-def ensure_thread(cur, listing_id: str, renter_email: str, lister_email: str) -> None:
-    cur.execute("""
-        INSERT INTO message_threads (listing_id, renter_email, lister_email, is_unlocked, created_at)
-        VALUES (%s, %s, %s, FALSE, NOW())
-        ON CONFLICT (listing_id, renter_email, lister_email) DO NOTHING
-    """, (listing_id, renter_email, lister_email))
-
+# -----------------------------------------------------------------------------
+# Request to Rent (SendGrid)
+# -----------------------------------------------------------------------------
 @app.post("/request-to-rent")
-def request_to_rent(payload: RequestToRentIn, current_user: str = Depends(verify_token)):
-    renter_email = current_user
-    if payload.end_date < payload.start_date:
-        raise HTTPException(status_code=400, detail="End date must be on/after start date")
-
-    listing_id = str(payload.listing_id)
-    conn = get_db_connection(); cur = conn.cursor()
-    try:
-        cur.execute("SELECT id, name, owner_email, price_per_day FROM listings WHERE id=%s AND deleted_at IS NULL", (listing_id,))
-        row = cur.fetchone()
-        if not row:
+def request_to_rent(body: RentRequestIn, current_user: Dict[str, Any] = Depends(get_current_user)):
+    with db_conn() as conn, conn.cursor() as cur:
+        cur.execute("""
+            SELECT id, name, location, price_per_day, owner_email
+            FROM listings WHERE id=%s
+        """, (str(body.listing_id),))
+        listing = cur.fetchone()
+        if not listing:
             raise HTTPException(status_code=404, detail="Listing not found")
-        listing_name, lister_email, price_per_day = row[1], row[2], float(row[3] or 0)
 
-        cur.execute("""
-            INSERT INTO rental_requests (listing_id, renter_email, lister_email, start_date, end_date, status, request_time)
-            VALUES (%s, %s, %s, %s, %s, 'requested', NOW())
-            RETURNING id
-        """, (listing_id, renter_email, lister_email, payload.start_date, payload.end_date))
-        req_id = cur.fetchone()[0]
+    lister_email = listing["owner_email"]
+    if not lister_email:
+        raise HTTPException(status_code=400, detail="Listing has no owner email on record")
 
-        ensure_thread(cur, listing_id, renter_email, lister_email)
-        conn.commit()
+    message_text = body.message or "Is your item available for rent on this/these days?"
+    date_str = ", ".join(body.dates) if body.dates else "(no dates provided)"
 
-        # email lister (best-effort)
-        star = renter_email[0] if renter_email else ""
-        obfuscated = (star + "******@" + renter_email.split("@")[1]) if "@" in renter_email else renter_email
-        html = f"""
-            <p>You have a new rental request for <strong>{listing_name}</strong>.</p>
-            <p>Renter: <strong>{obfuscated}</strong></p>
-            <p>Dates: {payload.start_date} → {payload.end_date}</p>
-            <p>Please review the request in your dashboard.</p>
-        """
-        send_alert_email(lister_email, "New rental request", html)
+    html_body = f"""
+    <p><strong>New rent request</strong></p>
+    <p>Item: {listing["name"]} ({listing["location"]})</p>
+    <p>Requested dates: {date_str}</p>
+    <p>Message: {message_text}</p>
+    <p>From: {current_user["email"]}</p>
+    """
 
-        return {"ok": True, "request_id": req_id, "listing_id": listing_id, "price_per_day": price_per_day}
-    finally:
-        cur.close(); conn.close()
+    if not SENDGRID_API_KEY:
+        logging.warning("SENDGRID_API_KEY not set; skipping email send")
+        return {"ok": True, "sent": False, "note": "SendGrid not configured"}
 
-@app.get("/my-rental-requests")
-def my_rental_requests(
-    role: Optional[str] = Query(None, description="renter|lister|all"),
-    current_user: str = Depends(verify_token)
-):
-    role = (role or "all").lower()
-    conn = get_db_connection(); cur = conn.cursor()
     try:
-        if role == "renter":
-            cur.execute("""
-                SELECT rr.*, COALESCE(l.name,'') AS listing_name
-                FROM rental_requests rr
-                LEFT JOIN listings l ON l.id=rr.listing_id
-                WHERE rr.renter_email=%s
-                ORDER BY rr.request_time DESC
-            """, (current_user,))
-        elif role == "lister":
-            cur.execute("""
-                SELECT rr.*, COALESCE(l.name,'') AS listing_name
-                FROM rental_requests rr
-                LEFT JOIN listings l ON l.id=rr.listing_id
-                WHERE rr.lister_email=%s
-                ORDER BY rr.request_time DESC
-            """, (current_user,))
-        else:
-            cur.execute("""
-                SELECT rr.*, COALESCE(l.name,'') AS listing_name
-                FROM rental_requests rr
-                LEFT JOIN listings l ON l.id=rr.listing_id
-                WHERE rr.renter_email=%s OR rr.lister_email=%s
-                ORDER BY rr.request_time DESC
-            """, (current_user, current_user))
-        return fetch_all_dict(cur)
-    finally:
-        cur.close(); conn.close()
-
-# Compat alias for older UIs
-@app.get("/rental-requests")
-def compat_rental_requests(
-    role: Optional[str] = Query(None, description="renter|lister|all|admin_all"),
-    limit: int = Query(200, ge=1, le=1000),
-    offset: int = Query(0, ge=0),
-    current_user: str = Depends(verify_token),
-):
-    if is_admin(current_user) and (role == "admin_all" or role == "all"):
-        conn = get_db_connection(); cur = conn.cursor()
-        try:
-            cur.execute(f"""
-                SELECT rr.id, rr.listing_id, COALESCE(l.name,'') AS listing_name,
-                       rr.renter_email, rr.lister_email, rr.start_date, rr.end_date,
-                       COALESCE(rr.status,'') AS status, COALESCE(rr.request_time,NOW()) AS request_time
-                FROM rental_requests rr
-                LEFT JOIN listings l ON l.id = rr.listing_id
-                ORDER BY rr.request_time DESC
-                LIMIT %s OFFSET %s
-            """, (limit, offset))
-            return fetch_all_dict(cur)
-        finally:
-            cur.close(); conn.close()
-    return my_rental_requests(role=role, current_user=current_user)
-
-@app.get("/admin/all-rental-requests")
-def admin_all_rental_requests(
-    limit: int = Query(200, ge=1, le=1000),
-    offset: int = Query(0, ge=0),
-    current_user: str = Depends(verify_token)
-):
-    if not is_admin(current_user):
-        raise HTTPException(status_code=403, detail="Admin only")
-    conn = get_db_connection(); cur = conn.cursor()
-    try:
-        cur.execute(f"""
-            SELECT rr.id, rr.listing_id, COALESCE(l.name,'') AS listing_name,
-                   rr.renter_email, rr.lister_email, rr.start_date, rr.end_date,
-                   COALESCE(rr.status,'') AS status, COALESCE(rr.request_time,NOW()) AS request_time
-            FROM rental_requests rr
-            LEFT JOIN listings l ON l.id = rr.listing_id
-            ORDER BY rr.request_time DESC
-            LIMIT %s OFFSET %s
-        """, (limit, offset))
-        return fetch_all_dict(cur)
-    finally:
-        cur.close(); conn.close()
-
-# ---------------------- Accept / Decline ----------------------
-@app.post("/rental-requests/{request_id}/accept")
-def accept_request(request_id: Union[int, str], payload: AcceptIn = Body(None), current_user: str = Depends(verify_token)):
-    conn = get_db_connection(); cur = conn.cursor()
-    try:
-        cur.execute("""
-            SELECT rr.*, l.name AS listing_name, l.price_per_day
-            FROM rental_requests rr
-            LEFT JOIN listings l ON l.id=rr.listing_id
-            WHERE rr.id=%s
-        """, (str(request_id),))
-        r = fetch_one_dict(cur)
-        if not r:
-            raise HTTPException(status_code=404, detail="Request not found")
-        if r["lister_email"] != current_user and not is_admin(current_user):
-            raise HTTPException(status_code=403, detail="Only the lister can accept")
-
-        onboarding_url = require_lister_ready_for_payments(r["lister_email"])
-        if onboarding_url:
-            raise HTTPException(status_code=409, detail={"onboarding_url": onboarding_url})
-
-        cur.execute("UPDATE rental_requests SET status='accepted', updated_at=NOW() WHERE id=%s", (str(request_id),))
-        conn.commit()
-
-        html = f"""
-            <p>Your request for <strong>{r.get('listing_name','')}</strong> was accepted.</p>
-            <p>Dates: {r.get('start_date')} → {r.get('end_date')}</p>
-            <p>Proceed to payment from your dashboard.</p>
-        """
-        send_alert_email(r.get("renter_email",""), "Request accepted", html)
-        return {"ok": True, "status": "accepted"}
-    finally:
-        cur.close(); conn.close()
-
-@app.post("/rental-requests/{request_id}/decline")
-def decline_request(request_id: Union[int, str], payload: DeclineIn = Body(...), current_user: str = Depends(verify_token)):
-    conn = get_db_connection(); cur = conn.cursor()
-    try:
-        cur.execute("""
-            SELECT rr.*, COALESCE(l.name,'') AS listing_name
-            FROM rental_requests rr
-            LEFT JOIN listings l ON l.id=rr.listing_id
-            WHERE rr.id=%s
-        """, (str(request_id),))
-        r = fetch_one_dict(cur)
-        if not r:
-            raise HTTPException(status_code=404, detail="Request not found")
-        if r["lister_email"] != current_user and not is_admin(current_user):
-            raise HTTPException(status_code=403, detail="Only the lister can decline")
-
-        cur.execute("UPDATE rental_requests SET status='declined', updated_at=NOW() WHERE id=%s", (str(request_id),))
-        conn.commit()
-
-        reason = (payload.reason or "").strip()
-        html = f"""
-            <p>The rental request for <strong>{r['listing_name']}</strong> has been declined.</p>
-            {('<p><em>Reason:</em> ' + reason + '</p>') if reason else ''}
-        """
-        send_alert_email(r.get("renter_email",""), "Rental request declined", html)
-        send_alert_email(r.get("lister_email",""), "You declined a rental request", html)
-
-        return {"ok": True, "status": "declined"}
-    finally:
-        cur.close(); conn.close()
-
-# ---------------------- Messaging (PII guard until paid) ----------------------
-EMAIL_RE = re.compile(r"[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}", re.I)
-PHONE_RE = re.compile(r"(\+?\d[\d\-\s\(\)]{7,}\d)")
-URL_RE = re.compile(r"(https?://|www\.)", re.I)
-
-def contains_pii(text: str) -> bool:
-    t = text or ""
-    return bool(EMAIL_RE.search(t) or PHONE_RE.search(t) or URL_RE.search(t))
-
-@app.get("/message-threads")
-def list_threads(current_user: str = Depends(verify_token)):
-    conn = get_db_connection(); cur = conn.cursor()
-    try:
-        cur.execute("""
-            SELECT mt.id, mt.listing_id, mt.renter_email, mt.lister_email, mt.is_unlocked, mt.created_at,
-                   COALESCE(l.name,'') AS listing_name
-            FROM message_threads mt
-            LEFT JOIN listings l ON l.id=mt.listing_id
-            WHERE mt.renter_email=%s OR mt.lister_email=%s
-            ORDER BY mt.created_at DESC
-        """, (current_user, current_user))
-        return fetch_all_dict(cur)
-    finally:
-        cur.close(); conn.close()
-
-@app.get("/messages/{thread_id}")
-def list_messages(thread_id: Union[int, str], current_user: str = Depends(verify_token)):
-    conn = get_db_connection(); cur = conn.cursor()
-    try:
-        cur.execute("SELECT renter_email, lister_email, is_unlocked FROM message_threads WHERE id=%s", (str(thread_id),))
-        row = cur.fetchone()
-        if not row:
-            raise HTTPException(status_code=404, detail="Thread not found")
-        renter, lister, unlocked = row[0], row[1], bool(row[2])
-        if current_user not in (renter, lister) and not is_admin(current_user):
-            raise HTTPException(status_code=403, detail="Forbidden")
-
-        cur.execute("""
-            SELECT id, thread_id, sender_email, body, created_at, COALESCE(system,false) AS system
-            FROM messages
-            WHERE thread_id=%s
-            ORDER BY created_at ASC
-        """, (str(thread_id),))
-        return fetch_all_dict(cur)
-    finally:
-        cur.close(); conn.close()
-
-@app.post("/messages/send")
-def send_message(payload: MessageSendIn, current_user: str = Depends(verify_token)):
-    thread_id = str(payload.thread_id).strip()
-    body = (payload.body or "").strip()
-    if not body:
-        raise HTTPException(status_code=400, detail="Empty message")
-
-    conn = get_db_connection(); cur = conn.cursor()
-    try:
-        cur.execute("SELECT renter_email, lister_email, is_unlocked FROM message_threads WHERE id=%s", (thread_id,))
-        row = cur.fetchone()
-        if not row:
-            raise HTTPException(status_code=404, detail="Thread not found")
-
-        renter, lister, unlocked = row[0], row[1], bool(row[2])
-        if current_user not in (renter, lister):
-            raise HTTPException(status_code=403, detail="Not a participant")
-        if not unlocked and contains_pii(body):
-            raise HTTPException(status_code=403, detail="PII (email/phone/URL) not allowed before payment")
-
-        cur.execute("""
-            INSERT INTO messages (thread_id, sender_email, body, created_at, system)
-            VALUES (%s, %s, %s, NOW(), FALSE)
-        """, (thread_id, current_user, body))
-        conn.commit()
-        return {"ok": True}
-    finally:
-        cur.close(); conn.close()
-
-# ---------------------- Stripe ----------------------
-@app.post("/stripe/create-onboarding-link")
-def stripe_onboard(current_user: str = Depends(verify_token)):
-    if not stripe_ready():
-        raise HTTPException(status_code=409, detail="Stripe not configured")
-    stripe_set_key()
-    acct_id = get_connect_account_id(current_user)
-    if not acct_id:
-        acct = stripe_sdk.Account.create(type="express", email=current_user)
-        set_connect_account_id(current_user, acct.id)
-        acct_id = acct.id
-    link = stripe_sdk.AccountLink.create(
-        account=acct_id,
-        refresh_url=f"{FRONTEND_BASE}/dashboard.html?onboarding=refresh",
-        return_url=f"{FRONTEND_BASE}/dashboard.html?onboarding=return",
-        type="account_onboarding",
-    )
-    return {"url": link.url, "account_id": acct_id}
-
-@app.post("/stripe/create-checkout-session")
-def stripe_checkout_start(payload: CheckoutStartIn, current_user: str = Depends(verify_token)):
-    if not stripe_ready():
-        raise HTTPException(status_code=409, detail="Stripe not configured")
-    stripe_set_key()
-
-    conn = get_db_connection(); cur = conn.cursor()
-    try:
-        cur.execute("""
-            SELECT rr.id, rr.listing_id, rr.renter_email, rr.lister_email, rr.start_date, rr.end_date,
-                   COALESCE(l.name,'') AS listing_name, COALESCE(l.price_per_day,0) AS price_per_day
-            FROM rental_requests rr
-            LEFT JOIN listings l ON l.id=rr.listing_id
-            WHERE rr.id=%s
-        """, (str(payload.request_id),))
-        r = fetch_one_dict(cur)
-        if not r:
-            raise HTTPException(status_code=404, detail="Request not found")
-        if r["renter_email"] != current_user and not is_admin(current_user):
-            raise HTTPException(status_code=403, detail="Only the renter can pay")
-
-        onboarding_url = require_lister_ready_for_payments(r["lister_email"])
-        if onboarding_url:
-            raise HTTPException(status_code=409, detail={"onboarding_url": onboarding_url})
-
-        days = (r["end_date"] - r["start_date"]).days + 1 if r["start_date"] and r["end_date"] else 1
-        days = max(1, days)
-        base_per_day = float(r.get("price_per_day", 0) or 0)
-        base_total_p = int(round(base_per_day * days * 100))
-        final_total_p = int(round(base_total_p * (1.0 + PLATFORM_FEE_RATE)))
-        fee_p = final_total_p - base_total_p
-
-        lister_acct = get_connect_account_id(r["lister_email"])
-        if not lister_acct:
-            onboarding_url = require_lister_ready_for_payments(r["lister_email"])
-            raise HTTPException(status_code=409, detail={"onboarding_url": onboarding_url or "Connect account missing"})
-
-        session = stripe_sdk.checkout.Session.create(
-            mode="payment",
-            line_items=[{
-                "price_data": {
-                    "currency": "gbp",
-                    "product_data": {"name": f"{r['listing_name']} x {days} day(s)"},
-                    "unit_amount": final_total_p,
-                },
-                "quantity": 1,
-            }],
-            success_url=f"{FRONTEND_BASE}/dashboard.html?paid={r['id']}",
-            cancel_url=f"{FRONTEND_BASE}/dashboard.html?cancel={r['id']}",
-            payment_intent_data={
-                "transfer_data": {"destination": lister_acct},
-                "application_fee_amount": fee_p,
-                "metadata": {
-                    "rental_request_id": str(r["id"]),
-                    "listing_id": str(r["listing_id"]),
-                    "renter_email": r["renter_email"],
-                    "lister_email": r["lister_email"],
-                    "days": str(days),
-                    "base_total_pence": str(base_total_p),
-                    "platform_fee_pence": str(fee_p),
-                    "final_total_pence": str(final_total_p),
-                },
-            },
-            metadata={
-                "rental_request_id": str(r["id"]),
-                "listing_id": str(r["listing_id"]),
-            },
+        sg = SendGridAPIClient(SENDGRID_API_KEY)
+        mail = Mail(
+            from_email=SENDGRID_FROM,
+            to_emails=lister_email,
+            subject="Rentonomic — New Rental Request",
+            html_content=html_body
         )
+        resp = sg.send(mail)
+        return {"ok": True, "sent": True, "status_code": resp.status_code}
+    except Exception as e:
+        logging.exception("SendGrid send failed: %s", e)
+        raise HTTPException(status_code=500, detail="Failed to send request email")
 
-        cur.execute("UPDATE rental_requests SET status='payment_initiated', updated_at=NOW() WHERE id=%s", (str(r["id"]),))
+# -----------------------------------------------------------------------------
+# Stripe Connect — Lister onboarding
+# -----------------------------------------------------------------------------
+@app.post("/stripe/create-onboarding-link")
+def stripe_onboarding_link(body: OnboardingIn | None = None, current_user: Dict[str, Any] = Depends(get_current_user)):
+    if not STRIPE_SECRET_KEY:
+        raise HTTPException(status_code=503, detail="Stripe not configured")
+    account_id = current_user.get("stripe_account_id")
+    try:
+        with db_conn() as conn, conn.cursor() as cur:
+            if not account_id:
+                acct = stripe.Account.create(type="express", email=current_user["email"])
+                account_id = acct["id"]
+                cur.execute("UPDATE users SET stripe_account_id=%s WHERE id=%s", (account_id, current_user["id"]))
+                conn.commit()
+        link = stripe.AccountLink.create(
+            account=account_id,
+            refresh_url=(body.refresh_url if body and body.refresh_url else f"{FRONTEND_URL}/dashboard.html"),
+            return_url=(body.return_url if body and body.return_url else f"{FRONTEND_URL}/dashboard.html"),
+            type="account_onboarding"
+        )
+        return {"ok": True, "url": link["url"], "account_id": account_id}
+    except Exception as e:
+        logging.exception("Stripe onboarding link failed: %s", e)
+        raise HTTPException(status_code=500, detail="Failed to create onboarding link")
+
+# -----------------------------------------------------------------------------
+# Stripe Checkout — Create session (90/10 split)
+# -----------------------------------------------------------------------------
+@app.post("/stripe/create-checkout-session")
+def create_checkout_session(body: CheckoutIn, current_user: Dict[str, Any] = Depends(get_current_user)):
+    if not STRIPE_SECRET_KEY:
+        raise HTTPException(status_code=503, detail="Stripe not configured")
+    if body.days < 1:
+        raise HTTPException(status_code=400, detail="Days must be at least 1")
+
+    # Fetch listing + lister account
+    with db_conn() as conn, conn.cursor() as cur:
+        cur.execute("""
+            SELECT l.id, l.name, l.location, l.price_per_day, l.owner_id, u.stripe_account_id, u.email AS owner_email
+            FROM listings l
+            LEFT JOIN users u ON u.id = l.owner_id
+            WHERE l.id = %s
+        """, (str(body.listing_id),))
+        listing = cur.fetchone()
+        if not listing:
+            raise HTTPException(status_code=404, detail="Listing not found")
+        lister_acct = listing.get("stripe_account_id")
+        if not lister_acct:
+            raise HTTPException(status_code=400, detail="Lister has not completed Stripe onboarding")
+
+        # Calculate prices
+        base_per_day = int(listing["price_per_day"])
+        renter_per_day = renter_price(base_per_day)  # base * 1.10 by default
+        unit_amount = gbp_to_pence(renter_per_day)   # pence
+        quantity = int(body.days)
+        amount_total = unit_amount * quantity
+
+        # application fee (10% of renter charge) — round to int
+        app_fee = int(round(amount_total * (PLATFORM_FEE_PERCENT / 100.0)))
+
+        success_url = body.success_url or f"{FRONTEND_URL}/dashboard.html?checkout=success"
+        cancel_url = body.cancel_url or f"{FRONTEND_URL}/dashboard.html?checkout=cancel"
+
+        # Create Checkout Session with destination charge to lister
+        try:
+            session = stripe.checkout.Session.create(
+                mode="payment",
+                success_url=success_url + "&session_id={CHECKOUT_SESSION_ID}",
+                cancel_url=cancel_url,
+                customer_email=current_user["email"],  # optional, helps receipts
+                line_items=[{
+                    "price_data": {
+                        "currency": CURRENCY,
+                        "product_data": {
+                            "name": f'{listing["name"]} — {listing["location"]}',
+                            "metadata": {
+                                "listing_id": str(listing["id"]),
+                                "owner_id": str(listing["owner_id"]),
+                            }
+                        },
+                        "unit_amount": unit_amount,
+                    },
+                    "quantity": quantity
+                }],
+                payment_intent_data={
+                    "application_fee_amount": app_fee,
+                    "transfer_data": {"destination": lister_acct},
+                    "metadata": {
+                        "listing_id": str(listing["id"]),
+                        "renter_email": current_user["email"],
+                        "days": str(quantity),
+                    }
+                },
+                metadata={
+                    "listing_id": str(listing["id"]),
+                    "renter_email": current_user["email"],
+                    "days": str(quantity),
+                    "dates": ",".join(body.dates or []),
+                }
+            )
+        except Exception as e:
+            logging.exception("Stripe session create failed: %s", e)
+            raise HTTPException(status_code=500, detail="Stripe session creation failed")
+
+        # Record pending rental (will flip to paid on webhook)
+        cur.execute("""
+            INSERT INTO rentals (listing_id, renter_id, renter_email, days, amount_total, currency, checkout_session_id, status)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, 'pending')
+            RETURNING id
+        """, (str(listing["id"]), current_user["id"], current_user["email"], quantity, amount_total, CURRENCY, session["id"]))
         conn.commit()
-        return {"url": session.url}
-    finally:
-        cur.close(); conn.close()
 
+        return {"ok": True, "url": session["url"], "session_id": session["id"]}
+
+# -----------------------------------------------------------------------------
+# Stripe Webhook — confirm payment, unlock messaging
+# -----------------------------------------------------------------------------
 @app.post("/stripe/webhook")
 async def stripe_webhook(request: Request):
-    if not stripe_ready() or not STRIPE_WEBHOOK_SECRET:
-        return {"ok": True, "skipped": "stripe not configured"}
+    if not STRIPE_WEBHOOK_SECRET:
+        # Protect: refuse if not configured
+        return JSONResponse(status_code=503, content={"error": "Webhook not configured"})
 
-    stripe_set_key()
     payload = await request.body()
-    sig_header = request.headers.get("stripe-signature", "")
+    sig_header = request.headers.get("Stripe-Signature")
     try:
-        event = stripe_sdk.Webhook.construct_event(payload, sig_header, STRIPE_WEBHOOK_SECRET)
-    except Exception:
-        raise HTTPException(status_code=400, detail="Invalid webhook")
+        event = stripe.Webhook.construct_event(payload=payload, sig_header=sig_header, secret=STRIPE_WEBHOOK_SECRET)
+    except Exception as e:
+        logging.warning("Invalid Stripe signature: %s", e)
+        return JSONResponse(status_code=400, content={"error": "Invalid signature"})
 
-    obj = event["data"]["object"]
-    meta = obj.get("metadata", {}) if isinstance(obj, dict) else {}
-    event_type = event.get("type")
+    # Handle events
+    try:
+        type_ = event["type"]
+        data = event["data"]["object"]
 
-    if event_type in ("checkout.session.completed", "payment_intent.succeeded"):
-        if event_type == "checkout.session.completed" and "payment_intent" in obj and isinstance(obj["payment_intent"], str):
-            pi = stripe_sdk.PaymentIntent.retrieve(obj["payment_intent"])
-            meta = pi.get("metadata", {}) or meta
-            amount_received = int(pi.get("amount_received", 0))
-        else:
-            amount_received = int(obj.get("amount_received", 0))
+        if type_ == "checkout.session.completed":
+            session = data
+            session_id = session.get("id")
+            payment_intent_id = session.get("payment_intent")
+            metadata = session.get("metadata", {}) or {}
+            listing_id = metadata.get("listing_id")
+            renter_email = metadata.get("renter_email")
+            days = int(metadata.get("days") or 1)
 
-        req_id = meta.get("rental_request_id")
-        listing_id = meta.get("listing_id")
-        renter_email = meta.get("renter_email")
-        lister_email = meta.get("lister_email")
-        base_total_p = int(meta.get("base_total_pence", "0") or 0)
-        fee_p = int(meta.get("platform_fee_pence", "0") or 0)
-        final_total_p = int(meta.get("final_total_pence", str(amount_received) if amount_received else "0") or 0)
-
-        if req_id and listing_id and renter_email and lister_email:
-            conn = get_db_connection(); cur = conn.cursor()
-            try:
-                cur.execute("UPDATE rental_requests SET status='paid', updated_at=NOW() WHERE id=%s", (str(req_id),))
+            # Update rental to paid
+            with db_conn() as conn, conn.cursor() as cur:
                 cur.execute("""
-                    UPDATE message_threads
-                       SET is_unlocked=TRUE
-                     WHERE listing_id=%s AND renter_email=%s AND lister_email=%s
-                """, (str(listing_id), renter_email, lister_email))
-                cur.execute("""
-                    INSERT INTO messages (thread_id, sender_email, body, created_at, system)
-                    SELECT id, %s, %s, NOW(), TRUE
-                      FROM message_threads
-                     WHERE listing_id=%s AND renter_email=%s AND lister_email=%s
-                """, ("system@rentonomic", "Payment confirmed. Messaging unlocked.", str(listing_id), renter_email, lister_email))
-                cur.execute("""
-                    INSERT INTO rentals (request_id, listing_id, renter_email, lister_email,
-                                         start_date, end_date, amount_base_pence, amount_renter_pence, platform_fee_pence)
-                    SELECT rr.id, rr.listing_id, rr.renter_email, rr.lister_email,
-                           rr.start_date, rr.end_date, %s, %s, %s
-                      FROM rental_requests rr
-                     WHERE rr.id=%s
-                    ON CONFLICT (request_id) DO NOTHING
-                """, (base_total_p, final_total_p, fee_p, str(req_id)))
+                    UPDATE rentals
+                    SET status='paid', payment_intent_id=%s
+                    WHERE checkout_session_id=%s
+                    RETURNING id, listing_id, renter_email
+                """, (payment_intent_id, session_id))
+                row = cur.fetchone()
+                if not row:
+                    # create if not found (idempotency)
+                    amount_total = 0
+                    currency = CURRENCY
+                    cur.execute("""
+                        INSERT INTO rentals (listing_id, renter_id, renter_email, days, amount_total, currency, checkout_session_id, payment_intent_id, status)
+                        VALUES (%s, gen_random_uuid(), %s, %s, %s, %s, %s, %s, 'paid')
+                        RETURNING id
+                    """, (listing_id, renter_email or "", days, amount_total, currency, session_id, payment_intent_id))
                 conn.commit()
-            finally:
-                try: cur.close(); conn.close()
-                except Exception: pass
 
-            try:
-                send_alert_email(renter_email, "Payment received — booking confirmed",
-                                 "<p>Your payment was successful. The chat is now unlocked.</p>")
-                send_alert_email(lister_email, "Your item has been booked",
-                                 "<p>The renter has paid. You can now chat and arrange handover.</p>")
-            except Exception:
-                pass
+            # (Optional) Notify lister/renter via email here
 
-    return {"ok": True}
+        elif type_ == "payment_intent.succeeded":
+            # Already handled via checkout.session.completed, but keep as safety net
+            pass
 
-# ---------------------- Diagnostics ----------------------
-@app.get("/")
-def root():
-    return {"ok": True, "service": "rentonomic-api"}
+        elif type_ in ("checkout.session.expired", "payment_intent.payment_failed"):
+            session_id = data.get("id") if "checkout" in type_ else None
+            payment_intent_id = data.get("id") if type_ == "payment_intent.payment_failed" else None
+            with db_conn() as conn, conn.cursor() as cur:
+                if session_id:
+                    cur.execute("""
+                        UPDATE rentals SET status='failed'
+                        WHERE checkout_session_id=%s
+                    """, (session_id,))
+                elif payment_intent_id:
+                    cur.execute("""
+                        UPDATE rentals SET status='failed'
+                        WHERE payment_intent_id=%s
+                    """, (payment_intent_id,))
+                conn.commit()
 
-@app.head("/")
-def root_head():
-    return Response(status_code=200)
-
-@app.get("/healthz")
-def healthz():
-    return {"ok": True}
-
-@app.head("/healthz")
-def healthz_head():
-    return Response(status_code=200)
-
-@app.get("/__diag/db")
-def diag_db(current_user: str = Depends(verify_token)):
-    """Admin-only DB connectivity & schema snapshot (safe fields)."""
-    if not is_admin(current_user):
-        raise HTTPException(status_code=403, detail="Admin only")
-    out: Dict[str, Any] = {"database_url_set": bool(DATABASE_URL)}
-    if not DATABASE_URL:
-        return out
-    try:
-        conn = get_db_connection(); cur = conn.cursor(cursor_factory=psycopg2.extras.DictCursor)
-        core_tables = ["users","listings","rental_requests","message_threads","messages","rentals","stripe_accounts"]
-        exists_map = {}
-        for t in core_tables:
-            cur.execute("SELECT 1 FROM information_schema.tables WHERE table_schema='public' AND table_name=%s", (t,))
-            exists_map[t] = bool(cur.fetchone())
-        out["tables"] = exists_map
-
-        if exists_map.get("listings"):
-            cur.execute("""
-                SELECT column_name FROM information_schema.columns
-                WHERE table_schema='public' AND table_name='listings'
-            """)
-            out["listings_columns"] = [r[0] for r in cur.fetchall()]
-
-        out["db_ok"] = True
-        return out
     except Exception as e:
-        out["db_ok"] = False
-        out["error"] = str(e)
-        return out
+        logging.exception("Webhook handling error: %s", e)
+        return JSONResponse(status_code=500, content={"error": "Webhook handler error"})
 
-@app.get("/__diag/cloudinary")
-def diag_cloudinary(current_user: str = Depends(verify_token)):
-    """Admin-only: verify Cloudinary package/env and attempt admin API ping."""
-    if not is_admin(current_user):
-        raise HTTPException(status_code=403, detail="Admin only")
-    out: Dict[str, Any] = {
-        "has_package": False,
-        "has_env": bool(os.environ.get("CLOUDINARY_URL")),
-        "ok": False,
-    }
-    try:
-        import cloudinary
-        import cloudinary.api as ca
-        out["has_package"] = True
-        cloudinary.config(cloudinary_url=os.environ.get("CLOUDINARY_URL"), secure=True)
-        try:
-            ping = ca.ping()
-            out["api_ping"] = ping
-            out["ok"] = True
-        except Exception as e:
-            out["error"] = str(e)
-    except Exception as e:
-        out["error"] = str(e)
-    return out
+    return PlainTextResponse("ok", status_code=200)
 
-@app.post("/__diag/cloudinary-upload")
-def diag_cloudinary_upload(
-    run: int = Query(0, ge=0, le=1),
-    current_user: str = Depends(verify_token)
-):
-    """Admin-only: optional tiny 1x1 PNG upload to confirm end-to-end Cloudinary upload."""
-    if not is_admin(current_user):
-        raise HTTPException(status_code=403, detail="Admin only")
-    if run != 1:
-        return {"ok": True, "hint": "Pass ?run=1 to perform a tiny test upload (1x1 PNG)."}
-    try:
-        import io, base64, time
-        import cloudinary
-        import cloudinary.uploader as cu
-        cloudinary.config(cloudinary_url=os.environ.get("CLOUDINARY_URL"), secure=True)
-        tiny_png = base64.b64decode("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR4nGNgYAAAAAMAASsJTYQAAAAASUVORK5CYII=")
-        buf = io.BytesIO(tiny_png)
-        res = cu.upload(buf, folder=os.environ.get("CLOUDINARY_FOLDER", "rentonomic/diag"), public_id=f"healthcheck-{int(time.time())}")
-        url = res.get("secure_url") or res.get("url")
-        return {"ok": True, "url": url}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+
 
 
 
