@@ -48,7 +48,7 @@ STRIPE_SECRET_KEY = os.getenv("STRIPE_SECRET_KEY")
 STRIPE_WEBHOOK_SECRET = os.getenv("STRIPE_WEBHOOK_SECRET")
 FRONTEND_URL = os.getenv("FRONTEND_URL", "https://rentonomic.netlify.app")
 CURRENCY = os.getenv("CURRENCY", "gbp")
-PLATFORM_FEE_PERCENT = float(os.getenv("PLATFORM_FEE_PERCENT", "10"))  # 10%
+PLATFORM_FEE_PERCENT = float(os.getenv("PLATFORM_FEE_PERCENT", "10"))
 
 if STRIPE_SECRET_KEY:
     stripe.api_key = STRIPE_SECRET_KEY
@@ -56,7 +56,7 @@ if STRIPE_SECRET_KEY:
 # -----------------------------
 # App & CORS
 # -----------------------------
-app = FastAPI(title="Rentonomic API", version="10.2")
+app = FastAPI(title="Rentonomic API", version="11.0")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],  # tighten later
@@ -73,7 +73,6 @@ def db_conn():
     return psycopg2.connect(DATABASE_URL, cursor_factory=psycopg2.extras.RealDictCursor)
 
 def run_migrations():
-    """Create minimal schema and add any missing columns."""
     with db_conn() as conn, conn.cursor() as cur:
         # users
         cur.execute("""
@@ -133,11 +132,7 @@ def verify_password(pw: str, hashed: str) -> bool:
     return hash_password(pw) == hashed
 
 def create_token(sub: str) -> str:
-    payload = {
-        "sub": sub,
-        "exp": datetime.utcnow() + timedelta(minutes=JWT_EXP_MIN),
-        "iat": datetime.utcnow(),
-    }
+    payload = {"sub": sub, "exp": datetime.utcnow() + timedelta(minutes=JWT_EXP_MIN), "iat": datetime.utcnow()}
     return jwt.encode(payload, JWT_SECRET, algorithm=JWT_ALG)
 
 def decode_token(token: str) -> dict:
@@ -243,7 +238,7 @@ def health():
     return {"ok": True, "time": datetime.utcnow().isoformat()}
 
 # -----------------------------
-# NEW: Auth status with Stripe details
+# Auth status (with Stripe flags)
 # -----------------------------
 @app.get("/me")
 def me(current_user: Dict[str, Any] = Depends(get_current_user)):
@@ -259,11 +254,7 @@ def me(current_user: Dict[str, Any] = Depends(get_current_user)):
             }
         except Exception:
             status = None
-    return {
-        "email": current_user["email"],
-        "stripe_account_id": acct_id,
-        "stripe_status": status,  # None if no account yet or not retrievable
-    }
+    return {"email": current_user["email"], "stripe_account_id": acct_id, "stripe_status": status}
 
 # -----------------------------
 # Auth
@@ -353,8 +344,7 @@ def update_listing(
     body: EditListingIn = None,
     current_user: Dict[str, Any] = Depends(get_current_user),
 ):
-    fields = []
-    vals: List[Any] = []
+    fields, vals = [], []
     for key in ["name", "location", "description", "price_per_day", "image_url"]:
         val = getattr(body, key) if body else None
         if val is not None:
@@ -429,27 +419,58 @@ def request_to_rent(body: RentRequestIn, current_user: Dict[str, Any] = Depends(
         raise HTTPException(status_code=500, detail="Failed to send request email")
 
 # -----------------------------
-# Stripe Connect — Onboarding
+# Stripe Connect — Onboarding (lighter, pre-filled)
 # -----------------------------
 @app.post("/stripe/create-onboarding-link")
 def stripe_onboarding_link(body: OnboardingIn | None = None, current_user: Dict[str, Any] = Depends(get_current_user)):
     if not STRIPE_SECRET_KEY:
         raise HTTPException(status_code=503, detail="Stripe not configured")
-    account_id = current_user.get("stripe_account_id")
+
     try:
         with db_conn() as conn, conn.cursor() as cur:
+            account_id = current_user.get("stripe_account_id")
+
             if not account_id:
-                acct = stripe.Account.create(type="express", email=current_user["email"])
+                # Create a lightweight Express account for an individual in GB
+                acct = stripe.Account.create(
+                    type="express",
+                    country="GB",
+                    email=current_user["email"],
+                    business_type="individual",
+                    capabilities={"transfers": {"requested": True}},  # lightest viable capability for payouts
+                    business_profile={
+                        # Pre-fill to avoid asking users for their own website
+                        "url": FRONTEND_URL,
+                        "product_description": "Peer-to-peer item rentals via Rentonomic",
+                        "support_email": "support@rentonomic.com",
+                    },
+                    default_currency=CURRENCY
+                )
                 account_id = acct["id"]
                 cur.execute("UPDATE users SET stripe_account_id=%s WHERE id=%s", (account_id, current_user["id"]))
                 conn.commit()
+            else:
+                # Ensure the profile has our platform details
+                try:
+                    stripe.Account.modify(
+                        account_id,
+                        business_profile={
+                            "url": FRONTEND_URL,
+                            "product_description": "Peer-to-peer item rentals via Rentonomic",
+                            "support_email": "support@rentonomic.com",
+                        }
+                    )
+                except Exception:
+                    pass
+
         link = stripe.AccountLink.create(
             account=account_id,
-            refresh_url=(body.refresh_url if body and body.refresh_url else f"{FRONTEND_URL}/dashboard.html"),
-            return_url=(body.return_url if body and body.return_url else f"{FRONTEND_URL}/dashboard.html"),
+            refresh_url=(body.refresh_url if body and body.refresh_url else f"{FRONTEND_URL}/list.html"),
+            return_url=(body.return_url  if body and body.return_url  else f"{FRONTEND_URL}/list.html"),
             type="account_onboarding"
         )
         return {"ok": True, "url": link["url"], "account_id": account_id}
+
     except Exception as e:
         logging.exception("Stripe onboarding link failed: %s", e)
         raise HTTPException(status_code=500, detail="Failed to create onboarding link")
@@ -590,6 +611,8 @@ async def stripe_webhook(request: Request):
         return JSONResponse(status_code=500, content={"error": "Webhook handler error"})
 
     return PlainTextResponse("ok", status_code=200)
+
+
 
 
 
