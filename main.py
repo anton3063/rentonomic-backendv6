@@ -1,14 +1,15 @@
+# main.py — Rentonomic API v12.1 (admin-ready, one-drop)
 import os
 import uuid
 import base64
 import hashlib
 import logging
-from datetime import datetime, timedelta, date
+from datetime import datetime, timedelta
 from typing import Optional, Any, Dict, List
 
 import psycopg2
 import psycopg2.extras
-from fastapi import FastAPI, Depends, HTTPException, UploadFile, File, Form, Request, Path, Body
+from fastapi import FastAPI, Depends, HTTPException, UploadFile, File, Form, Request, Path
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, PlainTextResponse
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
@@ -53,10 +54,12 @@ PLATFORM_FEE_PERCENT = float(os.getenv("PLATFORM_FEE_PERCENT", "10"))
 if STRIPE_SECRET_KEY:
     stripe.api_key = STRIPE_SECRET_KEY
 
+ADMIN_EMAIL = os.getenv("ADMIN_EMAIL", "admin@rentonomic.com").lower()
+
 # -----------------------------
 # App & CORS
 # -----------------------------
-app = FastAPI(title="Rentonomic API", version="12.0")
+app = FastAPI(title="Rentonomic API", version="12.1")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],  # tighten later
@@ -84,6 +87,10 @@ def run_migrations():
             created_at TIMESTAMP NOT NULL DEFAULT NOW()
         );
         """)
+        # add is_admin if missing
+        cur.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS is_admin BOOLEAN DEFAULT FALSE;")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_users_email ON users(lower(email));")
+
         # listings
         cur.execute("""
         CREATE TABLE IF NOT EXISTS listings (
@@ -98,6 +105,8 @@ def run_migrations():
             created_at TIMESTAMP NOT NULL DEFAULT NOW()
         );
         """)
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_listings_owner_id ON listings(owner_id);")
+
         # rentals
         cur.execute("""
         CREATE TABLE IF NOT EXISTS rentals (
@@ -116,6 +125,10 @@ def run_migrations():
             end_date DATE
         );
         """)
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_rentals_listing ON rentals(listing_id);")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_rentals_status ON rentals(status);")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_rentals_created ON rentals(created_at);")
+
         # messaging tables
         cur.execute("""
         CREATE TABLE IF NOT EXISTS message_threads (
@@ -126,6 +139,8 @@ def run_migrations():
             created_at TIMESTAMP NOT NULL DEFAULT NOW()
         );
         """)
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_threads_rental ON message_threads(rental_id);")
+
         cur.execute("""
         CREATE TABLE IF NOT EXISTS messages (
             id UUID PRIMARY KEY,
@@ -135,10 +150,8 @@ def run_migrations():
             created_at TIMESTAMP NOT NULL DEFAULT NOW()
         );
         """)
-        # helpful indexes
-        cur.execute("CREATE INDEX IF NOT EXISTS idx_listings_owner_id ON listings(owner_id);")
-        cur.execute("CREATE INDEX IF NOT EXISTS idx_threads_rental ON message_threads(rental_id);")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_messages_thread ON messages(thread_id);")
+
         conn.commit()
 
 run_migrations()
@@ -146,6 +159,11 @@ run_migrations()
 # -----------------------------
 # Utilities
 # -----------------------------
+def hash_password(pw: str) -> str:
+    salt = os.getenv("PW_SALT", "rentonomic-salt").encode()
+    return base64.b64encode(hashlib.pbk2_hmac("sha256", pw.encode(), salt, 120000)).decode()
+
+# fix typo: use correct pbkdf2_hmac
 def hash_password(pw: str) -> str:
     salt = os.getenv("PW_SALT", "rentonomic-salt").encode()
     return base64.b64encode(hashlib.pbkdf2_hmac("sha256", pw.encode(), salt, 120000)).decode()
@@ -172,11 +190,16 @@ def get_current_user(creds: HTTPAuthorizationCredentials = Depends(security)):
     if not email:
         raise HTTPException(status_code=401, detail="Invalid token payload")
     with db_conn() as conn, conn.cursor() as cur:
-        cur.execute("SELECT id, email, stripe_account_id FROM users WHERE email=%s", (email,))
+        cur.execute("SELECT id, email, stripe_account_id, COALESCE(is_admin,false) AS is_admin FROM users WHERE lower(email)=lower(%s)", (email,))
         row = cur.fetchone()
         if not row:
             raise HTTPException(status_code=401, detail="User not found")
         return row
+
+def require_admin(current_user: Dict[str, Any] = Depends(get_current_user)):
+    if (current_user.get("is_admin") is True) or (current_user.get("email","").lower() == ADMIN_EMAIL):
+        return current_user
+    raise HTTPException(status_code=403, detail="Admin only")
 
 def renter_price(base_price: int) -> int:
     return round(base_price * (1 + PLATFORM_FEE_PERCENT / 100.0))
@@ -197,7 +220,7 @@ def listing_public_shape(row: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 # -----------------------------
-# Pydantic models
+# Models
 # -----------------------------
 class SignupIn(BaseModel):
     email: EmailStr
@@ -279,7 +302,7 @@ def me(current_user: Dict[str, Any] = Depends(get_current_user)):
             }
         except Exception:
             status = None
-    return {"email": current_user["email"], "stripe_account_id": acct_id, "stripe_status": status}
+    return {"email": current_user["email"], "stripe_account_id": acct_id, "stripe_status": status, "is_admin": bool(current_user.get("is_admin"))}
 
 # -----------------------------
 # Auth
@@ -287,7 +310,7 @@ def me(current_user: Dict[str, Any] = Depends(get_current_user)):
 @app.post("/signup")
 def signup(body: SignupIn):
     with db_conn() as conn, conn.cursor() as cur:
-        cur.execute("SELECT 1 FROM users WHERE email=%s", (body.email,))
+        cur.execute("SELECT 1 FROM users WHERE lower(email)=lower(%s)", (body.email,))
         if cur.fetchone():
             raise HTTPException(status_code=400, detail="Email already registered")
         user_id = str(uuid.uuid4())
@@ -301,17 +324,17 @@ def signup(body: SignupIn):
 @app.post("/login")
 def login(body: LoginIn):
     with db_conn() as conn, conn.cursor() as cur:
-        cur.execute("SELECT id, email, password_hash FROM users WHERE email=%s", (body.email,))
+        cur.execute("SELECT id, email, password_hash FROM users WHERE lower(email)=lower(%s)", (body.email,))
         row = cur.fetchone()
         if not row or not verify_password(body.password, row["password_hash"]):
             raise HTTPException(status_code=401, detail="Invalid credentials")
     return {"token": create_token(body.email)}
 
 # -----------------------------
-# Listings
+# Listings (public/owner)
 # -----------------------------
 @app.get("/listings")
-def all_listings():
+def all_listings_public():
     with db_conn() as conn, conn.cursor() as cur:
         cur.execute("""
             SELECT id, name, location, description, price_per_day, image_url, created_at
@@ -320,6 +343,17 @@ def all_listings():
         """)
         rows = cur.fetchall()
     return [listing_public_shape(r) for r in rows]
+
+# alias that returns owner_email (admin UI prefers this first)
+@app.get("/all-listings")
+def all_listings_with_owner():
+    with db_conn() as conn, conn.cursor() as cur:
+        cur.execute("""
+            SELECT id, name, location, description, price_per_day, image_url, owner_email, created_at
+            FROM listings
+            ORDER BY created_at DESC
+        """)
+        return cur.fetchall()
 
 @app.get("/my-listings")
 def my_listings(current_user: Dict[str, Any] = Depends(get_current_user)):
@@ -330,8 +364,7 @@ def my_listings(current_user: Dict[str, Any] = Depends(get_current_user)):
             WHERE owner_id=%s
             ORDER BY created_at DESC
         """, (current_user["id"],))
-        rows = cur.fetchall()
-    return rows
+        return cur.fetchall()
 
 @app.post("/list")
 def create_listing(
@@ -373,8 +406,7 @@ def update_listing(
     for key in ["name", "location", "description", "price_per_day", "image_url"]:
         val = getattr(body, key) if body else None
         if val is not None:
-            fields.append(f"{key}=%s")
-            vals.append(val)
+            fields.append(f"{key}=%s"); vals.append(val)
     if not fields:
         raise HTTPException(status_code=400, detail="No fields to update")
     vals.extend([str(listing_id), current_user["id"]])
@@ -400,6 +432,69 @@ def delete_listing(listing_id: uuid.UUID, current_user: Dict[str, Any] = Depends
             raise HTTPException(status_code=404, detail="Listing not found or not owned by user")
         conn.commit()
     return {"ok": True}
+
+# -----------------------------
+# ADMIN — Listings & Rental Requests
+# -----------------------------
+@app.get("/admin/listings")
+def admin_listings(_: Dict[str, Any] = Depends(require_admin)):
+    with db_conn() as conn, conn.cursor() as cur:
+        cur.execute("""
+            SELECT id, name, location, description, price_per_day, image_url, owner_email, created_at
+            FROM listings
+            ORDER BY created_at DESC
+        """)
+        return cur.fetchall()
+
+@app.delete("/admin/listings/{listing_id}")
+def admin_delete_listing(listing_id: uuid.UUID, _: Dict[str, Any] = Depends(require_admin)):
+    with db_conn() as conn, conn.cursor() as cur:
+        cur.execute("DELETE FROM listings WHERE id=%s RETURNING id", (str(listing_id),))
+        row = cur.fetchone()
+        if not row:
+            raise HTTPException(status_code=404, detail="Listing not found")
+        conn.commit()
+    return {"ok": True}
+
+@app.get("/admin/all-rental-requests")
+def admin_all_rental_requests(_: Dict[str, Any] = Depends(require_admin)):
+    """
+    Returns site-wide rental rows shaped for the admin UI.
+    """
+    with db_conn() as conn, conn.cursor() as cur:
+        cur.execute("""
+            SELECT
+              r.id,
+              r.listing_id,
+              r.renter_email,
+              r.days,
+              r.status,
+              r.created_at,
+              r.start_date,
+              r.end_date,
+              l.name AS listing_name,
+              l.owner_email AS lister_email
+            FROM rentals r
+            LEFT JOIN listings l ON l.id = r.listing_id
+            ORDER BY r.created_at DESC
+        """)
+        rows = cur.fetchall()
+    # Shape keys to match the admin table’s tolerant readers
+    shaped = []
+    for r in rows:
+        shaped.append({
+            "id": str(r["id"]),
+            "listing_id": str(r["listing_id"]) if r.get("listing_id") else None,
+            "renter_email": r.get("renter_email"),
+            "lister_email": r.get("lister_email"),
+            "listing_name": r.get("listing_name"),
+            "status": r.get("status"),
+            "created_at": r.get("created_at").isoformat() if r.get("created_at") else None,
+            "start_date": r.get("start_date").isoformat() if r.get("start_date") else None,
+            "end_date": r.get("end_date").isoformat() if r.get("end_date") else None,
+            "days": r.get("days"),
+        })
+    return shaped
 
 # -----------------------------
 # Request to Rent (SendGrid)
@@ -461,9 +556,8 @@ def stripe_onboarding_link(body: OnboardingIn | None = None, current_user: Dict[
                     country="GB",
                     email=current_user["email"],
                     business_type="individual",
-                    capabilities={"transfers": {"requested": True}},  # payouts only
+                    capabilities={"transfers": {"requested": True}},
                     business_profile={
-                        # Friendly text instead of website field
                         "product_description": "Sharing items locally through Rentonomic"
                     },
                     default_currency=CURRENCY,
@@ -472,12 +566,11 @@ def stripe_onboarding_link(body: OnboardingIn | None = None, current_user: Dict[
                 cur.execute("UPDATE users SET stripe_account_id=%s WHERE id=%s", (account_id, current_user["id"]))
                 conn.commit()
             else:
-                # Clean old website & keep friendly description
                 try:
                     stripe.Account.modify(
                         account_id,
                         business_profile={
-                            "url": "",  # clear old website so Stripe doesn't ask for it
+                            "url": "",
                             "product_description": "Sharing items locally through Rentonomic"
                         }
                     )
@@ -581,7 +674,7 @@ def create_checkout_session(body: CheckoutIn, current_user: Dict[str, Any] = Dep
         return {"url": session["url"], "session_id": session["id"]}
 
 # -----------------------------
-# Messaging window helper
+# Messaging window helper & endpoints
 # -----------------------------
 def messaging_open_for(rental_like: Dict[str, Any]) -> bool:
     if rental_like.get("status") != "paid":
@@ -592,9 +685,6 @@ def messaging_open_for(rental_like: Dict[str, Any]) -> bool:
     cutoff = datetime.combine(end_d, datetime.min.time()) + timedelta(days=2)
     return datetime.utcnow() <= cutoff
 
-# -----------------------------
-# Messaging endpoints (paid-only; open until 48h after end_date)
-# -----------------------------
 def user_in_thread(user_id: str, thread: Dict[str, Any]) -> bool:
     return str(user_id) in {str(thread["renter_id"]), str(thread["lister_id"])}
 
@@ -794,6 +884,8 @@ async def stripe_webhook(request: Request):
         return JSONResponse(status_code=500, content={"error": "Webhook handler error"})
 
     return PlainTextResponse("ok", status_code=200)
+
+
 
 
 
