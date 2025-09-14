@@ -1,4 +1,3 @@
-
 import os
 import uuid
 import base64
@@ -57,7 +56,7 @@ if STRIPE_SECRET_KEY:
 # -----------------------------
 # App & CORS
 # -----------------------------
-app = FastAPI(title="Rentonomic API", version="10.0")
+app = FastAPI(title="Rentonomic API", version="10.1")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],  # tighten later
@@ -77,7 +76,8 @@ def run_migrations():
     """Create minimal schema without relying on extensions. Adds missing columns if table pre-exists."""
     with db_conn() as conn, conn.cursor() as cur:
         # users
-        cur.execute("""        CREATE TABLE IF NOT EXISTS users (
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS users (
             id UUID PRIMARY KEY,
             email TEXT UNIQUE NOT NULL,
             password_hash TEXT NOT NULL,
@@ -86,7 +86,8 @@ def run_migrations():
         );
         """)
         # listings
-        cur.execute("""        CREATE TABLE IF NOT EXISTS listings (
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS listings (
             id UUID PRIMARY KEY,
             name TEXT,
             location TEXT,
@@ -99,7 +100,8 @@ def run_migrations():
         );
         """)
         # rentals
-        cur.execute("""        CREATE TABLE IF NOT EXISTS rentals (
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS rentals (
             id UUID PRIMARY KEY,
             listing_id UUID NOT NULL,
             renter_id UUID NOT NULL,
@@ -114,7 +116,7 @@ def run_migrations():
         );
         """)
 
-        # Add missing columns in case table existed from old schema
+        # Add missing columns / indexes
         cur.execute("ALTER TABLE listings ADD COLUMN IF NOT EXISTS owner_id UUID;")
         cur.execute("ALTER TABLE listings ADD COLUMN IF NOT EXISTS owner_email TEXT;")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_listings_owner_id ON listings(owner_id);")
@@ -213,8 +215,12 @@ class CheckoutIn(BaseModel):
     success_url: Optional[str] = None
     cancel_url: Optional[str] = None
 
+class CheckoutOut(BaseModel):
+    url: str
+    session_id: str
+
 # -----------------------------
-# Exception handlers (friendly)
+# Exception handlers
 # -----------------------------
 from fastapi.exceptions import RequestValidationError
 
@@ -237,6 +243,17 @@ async def generic_handler(request: Request, exc: Exception):
 @app.get("/health")
 def health():
     return {"ok": True, "time": datetime.utcnow().isoformat()}
+
+# -----------------------------
+# NEW: Auth status for frontend (Option A)
+# -----------------------------
+@app.get("/me")
+def me(current_user: Dict[str, Any] = Depends(get_current_user)):
+    """Tiny status endpoint so the frontend can check Stripe status before listing."""
+    return {
+        "email": current_user["email"],
+        "stripe_account_id": current_user.get("stripe_account_id")
+    }
 
 # -----------------------------
 # Auth
@@ -270,7 +287,8 @@ def login(body: LoginIn):
 @app.get("/listings")
 def all_listings():
     with db_conn() as conn, conn.cursor() as cur:
-        cur.execute("""            SELECT id, name, location, description, price_per_day, image_url, created_at
+        cur.execute("""
+            SELECT id, name, location, description, price_per_day, image_url, created_at
             FROM listings
             ORDER BY created_at DESC
         """)
@@ -280,7 +298,8 @@ def all_listings():
 @app.get("/my-listings")
 def my_listings(current_user: Dict[str, Any] = Depends(get_current_user)):
     with db_conn() as conn, conn.cursor() as cur:
-        cur.execute("""            SELECT id, name, location, description, price_per_day, image_url, owner_email, created_at
+        cur.execute("""
+            SELECT id, name, location, description, price_per_day, image_url, owner_email, created_at
             FROM listings
             WHERE owner_id=%s
             ORDER BY created_at DESC
@@ -309,7 +328,8 @@ def create_listing(
 
     listing_id = str(uuid.uuid4())
     with db_conn() as conn, conn.cursor() as cur:
-        cur.execute("""            INSERT INTO listings (id, name, location, description, price_per_day, image_url, owner_id, owner_email)
+        cur.execute("""
+            INSERT INTO listings (id, name, location, description, price_per_day, image_url, owner_id, owner_email)
             VALUES (%s,%s,%s,%s,%s,%s,%s,%s)
             RETURNING id, name, location, description, price_per_day, image_url, owner_email, created_at
         """, (listing_id, name, location, description, price_per_day, final_url, current_user["id"], current_user["email"]))
@@ -334,7 +354,8 @@ def update_listing(
         raise HTTPException(status_code=400, detail="No fields to update")
     vals.extend([str(listing_id), current_user["id"]])
     with db_conn() as conn, conn.cursor() as cur:
-        cur.execute(f"""            UPDATE listings
+        cur.execute(f"""
+            UPDATE listings
             SET {', '.join(fields)}
             WHERE id=%s AND owner_id=%s
             RETURNING id, name, location, description, price_per_day, image_url, owner_email, created_at
@@ -361,7 +382,8 @@ def delete_listing(listing_id: uuid.UUID, current_user: Dict[str, Any] = Depends
 @app.post("/request-to-rent")
 def request_to_rent(body: RentRequestIn, current_user: Dict[str, Any] = Depends(get_current_user)):
     with db_conn() as conn, conn.cursor() as cur:
-        cur.execute("""            SELECT id, name, location, price_per_day, owner_email
+        cur.execute("""
+            SELECT id, name, location, price_per_day, owner_email
             FROM listings WHERE id=%s
         """, (str(body.listing_id),))
         listing = cur.fetchone()
@@ -374,7 +396,8 @@ def request_to_rent(body: RentRequestIn, current_user: Dict[str, Any] = Depends(
 
     message_text = body.message or "Is your item available for rent on this/these days?"
     date_str = ", ".join(body.dates) if body.dates else "(no dates provided)"
-    html_body = f"""    <p><strong>New rent request</strong></p>
+    html_body = f"""
+    <p><strong>New rent request</strong></p>
     <p>Item: {listing['name']} ({listing['location']})</p>
     <p>Requested dates: {date_str}</p>
     <p>Message: {message_text}</p>
@@ -424,10 +447,6 @@ def stripe_onboarding_link(body: OnboardingIn | None = None, current_user: Dict[
 # -----------------------------
 # Stripe Checkout — 90/10 split
 # -----------------------------
-class CheckoutOut(BaseModel):
-    url: str
-    session_id: str
-
 @app.post("/stripe/create-checkout-session", response_model=CheckoutOut)
 def create_checkout_session(body: CheckoutIn, current_user: Dict[str, Any] = Depends(get_current_user)):
     if not STRIPE_SECRET_KEY:
@@ -436,7 +455,8 @@ def create_checkout_session(body: CheckoutIn, current_user: Dict[str, Any] = Dep
         raise HTTPException(status_code=400, detail="Days must be at least 1")
 
     with db_conn() as conn, conn.cursor() as cur:
-        cur.execute("""            SELECT l.id, l.name, l.location, l.price_per_day, l.owner_id, u.stripe_account_id
+        cur.execute("""
+            SELECT l.id, l.name, l.location, l.price_per_day, l.owner_id, u.stripe_account_id
             FROM listings l
             LEFT JOIN users u ON u.id = l.owner_id
             WHERE l.id=%s
@@ -499,7 +519,8 @@ def create_checkout_session(body: CheckoutIn, current_user: Dict[str, Any] = Dep
             raise HTTPException(status_code=500, detail="Stripe session creation failed")
 
         rental_id = str(uuid.uuid4())
-        cur.execute("""            INSERT INTO rentals (id, listing_id, renter_id, renter_email, days, amount_total, currency, checkout_session_id, status)
+        cur.execute("""
+            INSERT INTO rentals (id, listing_id, renter_id, renter_email, days, amount_total, currency, checkout_session_id, status)
             VALUES (%s,%s,%s,%s,%s,%s,%s,%s,'pending')
         """, (rental_id, str(listing["id"]), current_user["id"], current_user["email"], quantity, amount_total, CURRENCY, session["id"]))
         conn.commit()
@@ -531,14 +552,16 @@ async def stripe_webhook(request: Request):
             payment_intent_id = data.get("payment_intent")
 
             with db_conn() as conn, conn.cursor() as cur:
-                cur.execute("""                    UPDATE rentals SET status='paid', payment_intent_id=%s
+                cur.execute("""
+                    UPDATE rentals SET status='paid', payment_intent_id=%s
                     WHERE checkout_session_id=%s
                     RETURNING id
                 """, (payment_intent_id, session_id))
                 row = cur.fetchone()
                 if not row:
                     # idempotent fallback (rare)
-                    cur.execute("""                        INSERT INTO rentals (id, listing_id, renter_id, renter_email, days, amount_total, currency, checkout_session_id, payment_intent_id, status)
+                    cur.execute("""
+                        INSERT INTO rentals (id, listing_id, renter_id, renter_email, days, amount_total, currency, checkout_session_id, payment_intent_id, status)
                         VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, 'paid')
                     """, (str(uuid.uuid4()), str(uuid.uuid4()), str(uuid.uuid4()), "", 1, 0, CURRENCY, session_id, payment_intent_id))
                 conn.commit()
@@ -558,6 +581,8 @@ async def stripe_webhook(request: Request):
         return JSONResponse(status_code=500, content={"error": "Webhook handler error"})
 
     return PlainTextResponse("ok", status_code=200)
+
+
 
 
 
