@@ -56,7 +56,7 @@ if STRIPE_SECRET_KEY:
 # -----------------------------
 # App & CORS
 # -----------------------------
-app = FastAPI(title="Rentonomic API", version="10.1")
+app = FastAPI(title="Rentonomic API", version="10.2")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],  # tighten later
@@ -73,7 +73,7 @@ def db_conn():
     return psycopg2.connect(DATABASE_URL, cursor_factory=psycopg2.extras.RealDictCursor)
 
 def run_migrations():
-    """Create minimal schema without relying on extensions. Adds missing columns if table pre-exists."""
+    """Create minimal schema and add any missing columns."""
     with db_conn() as conn, conn.cursor() as cur:
         # users
         cur.execute("""
@@ -107,16 +107,14 @@ def run_migrations():
             renter_id UUID NOT NULL,
             renter_email TEXT NOT NULL,
             days INTEGER NOT NULL,
-            amount_total INTEGER NOT NULL, -- minor units (pence)
+            amount_total INTEGER NOT NULL, -- pence
             currency TEXT NOT NULL,
             checkout_session_id TEXT,
             payment_intent_id TEXT,
-            status TEXT NOT NULL DEFAULT 'pending', -- pending|paid|failed|canceled
+            status TEXT NOT NULL DEFAULT 'pending',
             created_at TIMESTAMP NOT NULL DEFAULT NOW()
         );
         """)
-
-        # Add missing columns / indexes
         cur.execute("ALTER TABLE listings ADD COLUMN IF NOT EXISTS owner_id UUID;")
         cur.execute("ALTER TABLE listings ADD COLUMN IF NOT EXISTS owner_email TEXT;")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_listings_owner_id ON listings(owner_id);")
@@ -245,14 +243,26 @@ def health():
     return {"ok": True, "time": datetime.utcnow().isoformat()}
 
 # -----------------------------
-# NEW: Auth status for frontend (Option A)
+# NEW: Auth status with Stripe details
 # -----------------------------
 @app.get("/me")
 def me(current_user: Dict[str, Any] = Depends(get_current_user)):
-    """Tiny status endpoint so the frontend can check Stripe status before listing."""
+    acct_id = current_user.get("stripe_account_id")
+    status = None
+    if STRIPE_SECRET_KEY and acct_id:
+        try:
+            acct = stripe.Account.retrieve(acct_id)
+            status = {
+                "details_submitted": bool(acct.get("details_submitted")),
+                "charges_enabled": bool(acct.get("charges_enabled")),
+                "payouts_enabled": bool(acct.get("payouts_enabled")),
+            }
+        except Exception:
+            status = None
     return {
         "email": current_user["email"],
-        "stripe_account_id": current_user.get("stripe_account_id")
+        "stripe_account_id": acct_id,
+        "stripe_status": status,  # None if no account yet or not retrievable
     }
 
 # -----------------------------
@@ -559,7 +569,6 @@ async def stripe_webhook(request: Request):
                 """, (payment_intent_id, session_id))
                 row = cur.fetchone()
                 if not row:
-                    # idempotent fallback (rare)
                     cur.execute("""
                         INSERT INTO rentals (id, listing_id, renter_id, renter_email, days, amount_total, currency, checkout_session_id, payment_intent_id, status)
                         VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, 'paid')
@@ -581,6 +590,8 @@ async def stripe_webhook(request: Request):
         return JSONResponse(status_code=500, content={"error": "Webhook handler error"})
 
     return PlainTextResponse("ok", status_code=200)
+
+
 
 
 
