@@ -1,17 +1,17 @@
-# main.py — Rentonomic API (full, with CORS regex + UUID adapter)
-# - CORS regex allows rentonomic.com, subdomains, netlify.app, localhost
-# - SendGrid US/EU via SENDGRID_API_HOST (auto-fallback to EU on 401)
-# - Masked emails in notifications + dashboard
-# - Message threads + chat (locked until paid)
-# - Request-to-Rent flow (emails, thread auto-create)
-# - Stripe checkout + webhook unlocks thread and marks rental paid
+# main.py — Rentonomic API (Approve/Decline signed links added)
+# - TEMP: CORS allow-all to unblock flows (tighten later)
+# - UUID adapter fix for psycopg2
+# - Request-to-Rent creates/uses thread and emails lister
+# - Email now includes **Approve / Decline** one-click links (signed, expiring)
+# - Stripe webhook marks rental paid and unlocks thread
+# - Threads/messages APIs for dashboard
 # - Idempotent migrations
-# - UUID adapter fix for psycopg2 ("can't adapt type 'UUID'")
 
 import os
 import uuid
 import base64
 import hashlib
+import hmac
 import logging
 from datetime import datetime, timedelta
 from typing import Optional, List
@@ -25,9 +25,9 @@ import uuid as _uuid
 def _adapt_uuid(u: _uuid.UUID): return AsIs(f"'{u}'::uuid")
 register_adapter(_uuid.UUID, _adapt_uuid)
 
-from fastapi import FastAPI, Depends, HTTPException, UploadFile, File, Form, Request
+from fastapi import FastAPI, Depends, HTTPException, UploadFile, File, Form, Request, Query
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse, PlainTextResponse
+from fastapi.responses import JSONResponse, PlainTextResponse, HTMLResponse, RedirectResponse
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from pydantic import BaseModel, EmailStr
 
@@ -53,8 +53,7 @@ JWT_EXP_MIN = int(os.getenv("JWT_EXP_MIN", "43200"))  # 30 days
 
 SENDGRID_API_KEY = os.getenv("SENDGRID_API_KEY")
 SENDGRID_FROM = os.getenv("SENDGRID_FROM", "alert@rentonomic.com")
-# Optional: set to "https://api.eu.sendgrid.com" if your account is EU
-SENDGRID_API_HOST = os.getenv("SENDGRID_API_HOST", "https://api.sendgrid.com")
+SENDGRID_API_HOST = os.getenv("SENDGRID_API_HOST", "https://api.sendgrid.com")  # set EU host if needed
 
 CLOUDINARY_URL = os.getenv("CLOUDINARY_URL")
 if CLOUDINARY_URL:
@@ -63,27 +62,27 @@ if CLOUDINARY_URL:
 STRIPE_SECRET_KEY = os.getenv("STRIPE_SECRET_KEY")
 STRIPE_WEBHOOK_SECRET = os.getenv("STRIPE_WEBHOOK_SECRET")
 FRONTEND_URL = os.getenv("FRONTEND_URL", "https://rentonomic.com")
+BACKEND_URL = os.getenv("BACKEND_URL", "https://rentonomic-backend.onrender.com")
 
 stripe.api_key = STRIPE_SECRET_KEY
 
 # -----------------------------
-# App + CORS
+# App + (TEMP) permissive CORS
 # -----------------------------
-app = FastAPI(title="Rentonomic API", version="13.2")
+app = FastAPI(title="Rentonomic API", version="14.0")
 
-# Allow rentonomic.com, *.rentonomic.com, *.netlify.app, localhost (any port)
+# TEMP: allow all origins; no cookies/credentials; all methods/headers
 app.add_middleware(
     CORSMiddleware,
-    allow_origin_regex=r"^https?://(localhost(:\d+)?|127\.0\.0\.1(:\d+)?|([a-z0-9-]+\.)?rentonomic\.com|([a-z0-9-]+\.)?netlify\.app)$",
-    allow_credentials=True,
-    allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],
-    allow_headers=["Authorization", "Content-Type", "Stripe-Signature", "*"],
+    allow_origins=["*"],
+    allow_credentials=False,
+    allow_methods=["*"],
+    allow_headers=["*"],
     expose_headers=["*"],
     max_age=86400,
 )
 
 security = HTTPBearer()
-
 logging.basicConfig(level=logging.INFO)
 
 # -----------------------------
@@ -136,7 +135,7 @@ def _b64url_decode(s: str) -> bytes:
     return base64.urlsafe_b64decode((s + pad).encode())
 
 def jwt_encode(payload: dict, secret: str) -> str:
-    import json, hmac
+    import json
     header = {"alg": JWT_ALG, "typ": "JWT"}
     h = _b64url(json.dumps(header, separators=(",", ":"), sort_keys=True).encode())
     p = _b64url(json.dumps(payload, separators=(",", ":"), sort_keys=True).encode())
@@ -145,7 +144,7 @@ def jwt_encode(payload: dict, secret: str) -> str:
     return f"{h}.{p}.{_b64url(sig)}"
 
 def jwt_decode(token: str, secret: str) -> dict:
-    import json, hmac
+    import json
     try:
         h, p, s = token.split(".")
         signing_input = f"{h}.{p}".encode()
@@ -153,7 +152,9 @@ def jwt_decode(token: str, secret: str) -> dict:
         calc = hmac.new(secret.encode(), signing_input, hashlib.sha256).digest()
         if not hmac.compare_digest(sig, calc):
             raise HTTPException(status_code=401, detail="Invalid token signature")
-        payload = json.loads(_b64url_decode(p))
+        payload = _b64url_decode(p)
+        import json as _json
+        payload = _json.loads(payload)
         if "exp" in payload and datetime.utcfromtimestamp(payload["exp"]) < datetime.utcnow():
             raise HTTPException(status_code=401, detail="Token expired")
         return payload
@@ -174,14 +175,33 @@ def admin_guard(user: dict):
         raise HTTPException(403, "Admin only")
 
 # -----------------------------
+# One-click action signing (Approve/Decline)
+# -----------------------------
+def make_action_token(action: str, thread_id: uuid.UUID, ttl_minutes: int = 7*24*60) -> str:
+    exp = int((datetime.utcnow() + timedelta(minutes=ttl_minutes)).timestamp())
+    raw = f"{action}|{thread_id}|{exp}".encode()
+    sig = hmac.new(JWT_SECRET.encode(), raw, hashlib.sha256).digest()
+    return f"{exp}.{_b64url(sig)}"
+
+def verify_action_token(action: str, thread_id: uuid.UUID, token: str) -> bool:
+    try:
+        exp_str, sig_b64 = token.split(".", 1)
+        exp = int(exp_str)
+        if datetime.utcfromtimestamp(exp) < datetime.utcnow():
+            return False
+        raw = f"{action}|{thread_id}|{exp}".encode()
+        expected = hmac.new(JWT_SECRET.encode(), raw, hashlib.sha256).digest()
+        return hmac.compare_digest(expected, _b64url_decode(sig_b64))
+    except Exception:
+        return False
+
+# -----------------------------
 # Migrations (idempotent)
 # -----------------------------
 def migrate():
     with get_conn() as conn:
         with conn.cursor() as cur:
-            # UUID helper
             cur.execute("CREATE EXTENSION IF NOT EXISTS pgcrypto;")
-            # users
             cur.execute("""
             CREATE TABLE IF NOT EXISTS users (
                 id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -189,9 +209,7 @@ def migrate():
                 password_hash TEXT NOT NULL,
                 is_admin BOOLEAN NOT NULL DEFAULT FALSE,
                 created_at TIMESTAMPTZ NOT NULL DEFAULT now()
-            );
-            """)
-            # listings
+            );""")
             cur.execute("""
             CREATE TABLE IF NOT EXISTS listings (
                 id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -203,9 +221,7 @@ def migrate():
                 price_per_day NUMERIC NOT NULL DEFAULT 0,
                 image_url TEXT,
                 created_at TIMESTAMPTZ NOT NULL DEFAULT now()
-            );
-            """)
-            # rentals
+            );""")
             cur.execute("""
             CREATE TABLE IF NOT EXISTS rentals (
                 id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -220,9 +236,7 @@ def migrate():
                 end_date DATE,
                 status TEXT NOT NULL DEFAULT 'pending',
                 created_at TIMESTAMPTZ NOT NULL DEFAULT now()
-            );
-            """)
-            # message_threads
+            );""")
             cur.execute("""
             CREATE TABLE IF NOT EXISTS message_threads (
                 thread_id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -237,9 +251,7 @@ def migrate():
                 is_unlocked BOOLEAN NOT NULL DEFAULT FALSE,
                 status TEXT NOT NULL DEFAULT 'pending',
                 created_at TIMESTAMPTZ NOT NULL DEFAULT now()
-            );
-            """)
-            # messages
+            );""")
             cur.execute("""
             CREATE TABLE IF NOT EXISTS messages (
                 id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -247,9 +259,7 @@ def migrate():
                 sender_id UUID REFERENCES users(id),
                 body TEXT NOT NULL,
                 created_at TIMESTAMPTZ NOT NULL DEFAULT now()
-            );
-            """)
-            # indexes
+            );""")
             cur.execute("CREATE INDEX IF NOT EXISTS idx_listings_owner ON listings(owner_id);")
             cur.execute("CREATE INDEX IF NOT EXISTS idx_rentals_listing ON rentals(listing_id);")
             cur.execute("CREATE INDEX IF NOT EXISTS idx_threads_listing ON message_threads(listing_id);")
@@ -286,7 +296,6 @@ def send_email_html(to_addr: str, subject: str, html: str):
         subject=subject,
         html_content=Content("text/html", html),
     )
-    # Try configured host first; on 401 fallback to EU host once
     try:
         resp = sg_client().send(mail)
         if resp.status_code not in (200, 202):
@@ -352,9 +361,8 @@ def get_listings():
             LIMIT 100
         """)
         rows = cur.fetchall()
-        out = []
-        for r in rows:
-            out.append({
+        return [
+            {
                 "id": str(r["id"]),
                 "name": r["name"],
                 "location": r["location"],
@@ -365,8 +373,9 @@ def get_listings():
                 "created_at": r["created_at"].isoformat(),
                 "owner_email": r["owner_email"],
                 "owner_id": str(r["owner_id"]) if r["owner_id"] else None,
-            })
-        return out
+            }
+            for r in rows
+        ]
 
 @app.get("/my-listings")
 def my_listings(user=Depends(get_current_user)):
@@ -542,7 +551,7 @@ def post_message(thread_id: uuid.UUID, data: MessageIn, user=Depends(get_current
         return {"id": str(mid), "created_at": created_at.isoformat()}
 
 # -----------------------------
-# Request to Rent
+# Request to Rent (+ email with Approve/Decline links)
 # -----------------------------
 def create_or_get_thread_for_listing(listing_id: uuid.UUID, current_user: dict, start_date: Optional[str], end_date: Optional[str]) -> uuid.UUID:
     uid = uuid.UUID(current_user["sub"])
@@ -553,15 +562,13 @@ def create_or_get_thread_for_listing(listing_id: uuid.UUID, current_user: dict, 
             raise HTTPException(404, "Listing not found")
         lister_id = lst["owner_id"]
         lister_email = lst["owner_email"]
-        renter_id = uid
-        renter_email = current_user.get("email")
 
         # existing thread?
         cur.execute("""
             SELECT thread_id FROM message_threads
             WHERE listing_id=%s AND lister_id=%s AND renter_id=%s
             ORDER BY created_at DESC LIMIT 1
-        """, (listing_id, lister_id, renter_id))
+        """, (listing_id, lister_id, uid))
         th = cur.fetchone()
         if th:
             thread_id = th["thread_id"]
@@ -576,21 +583,29 @@ def create_or_get_thread_for_listing(listing_id: uuid.UUID, current_user: dict, 
             INSERT INTO message_threads(listing_id, lister_id, renter_id, lister_email, renter_email, start_date, end_date, status, is_unlocked)
             VALUES (%s,%s,%s,%s,%s,%s,%s,'pending',FALSE)
             RETURNING thread_id
-        """, (listing_id, lister_id, renter_id, lister_email, renter_email, start_date, end_date))
+        """, (listing_id, lister_id, uid, lister_email, current_user.get("email"), start_date, end_date))
         thread_id = cur.fetchone()["thread_id"]
         conn.commit()
         return thread_id
 
-def send_rent_request_email(listing_name: str, lister_email: str, renter_email: str, start_date: Optional[str], end_date: Optional[str]):
+def send_rent_request_email_with_actions(listing_name: str, lister_email: str, renter_email: str, thread_id: uuid.UUID, start_date: Optional[str], end_date: Optional[str]):
     masked = mask_email(renter_email)
     dashboard_url = f"{FRONTEND_URL}/dashboard.html"
+    approve_token = make_action_token("approve", thread_id)
+    decline_token = make_action_token("decline", thread_id)
+    approve_url = f"{BACKEND_URL}/action/approve?tid={thread_id}&token={approve_token}"
+    decline_url = f"{BACKEND_URL}/action/decline?tid={thread_id}&token={decline_token}"
+
     html = f"""
       <div style="font-family:system-ui,-apple-system,Segoe UI,Roboto,Ubuntu,Arial,sans-serif;line-height:1.5;color:#111">
         <h2>New rental enquiry</h2>
         <p><strong>{masked}</strong> has requested to rent your item <strong>{listing_name}</strong>.</p>
         <p>Dates requested: <strong>{start_date or 'n/a'} → {end_date or 'n/a'}</strong></p>
-        <p>Please reply in your dashboard:</p>
-        <p><a href="{dashboard_url}" style="display:inline-block;background:#2ea44f;color:#fff;padding:10px 14px;border-radius:8px;text-decoration:none">Open Dashboard</a></p>
+        <div style="margin:16px 0;display:flex;gap:10px;">
+          <a href="{approve_url}" style="background:#16a34a;color:#fff;padding:10px 14px;border-radius:8px;text-decoration:none">Approve</a>
+          <a href="{decline_url}" style="background:#ef4444;color:#fff;padding:10px 14px;border-radius:8px;text-decoration:none">Decline</a>
+          <a href="{dashboard_url}" style="background:#1f2937;color:#fff;padding:10px 14px;border-radius:8px;text-decoration:none">Open Dashboard</a>
+        </div>
         <p style="color:#555;font-size:12px">For privacy, renter emails are masked. Chat happens inside your Rentonomic dashboard.</p>
       </div>
     """
@@ -614,8 +629,8 @@ def request_to_rent(data: RentRequestIn, user=Depends(get_current_user)):
 
     thread_id = create_or_get_thread_for_listing(data.listing_id, user, start_date, end_date)
 
-    # email to lister
-    send_rent_request_email(listing_name, lister_email, user.get("email"), start_date, end_date)
+    # email to lister with Approve/Decline actions
+    send_rent_request_email_with_actions(listing_name, lister_email, user.get("email"), thread_id, start_date, end_date)
 
     # system message in thread
     with get_conn() as conn, conn.cursor() as cur:
@@ -624,6 +639,55 @@ def request_to_rent(data: RentRequestIn, user=Depends(get_current_user)):
         conn.commit()
 
     return {"ok": True, "thread_id": str(thread_id)}
+
+# -----------------------------
+# One-click Approve / Decline endpoints
+# -----------------------------
+def _action_result_page(title: str, message: str, redirect_url: str) -> str:
+    return f"""<!doctype html>
+<html><head>
+<meta charset="utf-8" />
+<title>{title}</title>
+<meta http-equiv="refresh" content="4; url={redirect_url}">
+<style>
+body{{font-family:system-ui,-apple-system,Segoe UI,Roboto,Ubuntu,Arial,sans-serif;padding:32px;color:#111}}
+.card{{max-width:560px;margin:auto;border:1px solid #e5e7eb;border-radius:12px;padding:24px;box-shadow:0 2px 10px rgba(0,0,0,.05)}}
+.btn{{display:inline-block;padding:10px 14px;border-radius:8px;background:#1f2937;color:#fff;text-decoration:none}}
+</style>
+</head>
+<body>
+  <div class="card">
+    <h2>{title}</h2>
+    <p>{message}</p>
+    <p><a class="btn" href="{redirect_url}">Go to Dashboard</a></p>
+    <p style="color:#6b7280;font-size:12px">You will be redirected shortly…</p>
+  </div>
+</body></html>"""
+
+@app.get("/action/approve")
+def action_approve(tid: uuid.UUID = Query(...), token: str = Query(...)):
+    if not verify_action_token("approve", tid, token):
+        return HTMLResponse(_action_result_page("Link invalid", "Sorry, this approval link is invalid or has expired.", f"{FRONTEND_URL}/dashboard.html"), status_code=400)
+    with get_conn() as conn, conn.cursor() as cur:
+        # Ensure thread exists
+        cur.execute("SELECT thread_id FROM message_threads WHERE thread_id=%s", (tid,))
+        if not cur.fetchone():
+            return HTMLResponse(_action_result_page("Not found", "This conversation thread no longer exists.", f"{FRONTEND_URL}/dashboard.html"), status_code=404)
+        cur.execute("UPDATE message_threads SET status='approved' WHERE thread_id=%s", (tid,))
+        conn.commit()
+    return HTMLResponse(_action_result_page("Approved", "You approved this rental request.", f"{FRONTEND_URL}/dashboard.html"))
+
+@app.get("/action/decline")
+def action_decline(tid: uuid.UUID = Query(...), token: str = Query(...)):
+    if not verify_action_token("decline", tid, token):
+        return HTMLResponse(_action_result_page("Link invalid", "Sorry, this decline link is invalid or has expired.", f"{FRONTEND_URL}/dashboard.html"), status_code=400)
+    with get_conn() as conn, conn.cursor() as cur:
+        cur.execute("SELECT thread_id FROM message_threads WHERE thread_id=%s", (tid,))
+        if not cur.fetchone():
+            return HTMLResponse(_action_result_page("Not found", "This conversation thread no longer exists.", f"{FRONTEND_URL}/dashboard.html"), status_code=404)
+        cur.execute("UPDATE message_threads SET status='declined' WHERE thread_id=%s", (tid,))
+        conn.commit()
+    return HTMLResponse(_action_result_page("Declined", "You declined this rental request.", f"{FRONTEND_URL}/dashboard.html"))
 
 # -----------------------------
 # Stripe checkout + webhook
@@ -640,7 +704,6 @@ def create_checkout_session(data: CheckoutIn, user=Depends(get_current_user)):
     thread_id = create_or_get_thread_for_listing(data.listing_id, user, start_date, end_date)
 
     with get_conn() as conn, conn.cursor(cursor_factory=psycopg2.extras.DictCursor) as cur:
-        # create rental row (pending)
         cur.execute("""
             INSERT INTO rentals(listing_id, lister_id, renter_id, renter_email, amount_total, currency, status, start_date, end_date)
             SELECT %s, l.owner_id, %s, %s, %s, %s, 'pending', %s, %s
@@ -650,7 +713,6 @@ def create_checkout_session(data: CheckoutIn, user=Depends(get_current_user)):
         """, (data.listing_id, uuid.UUID(user["sub"]), data.renter_email, data.amount_total, data.currency,
               start_date, end_date, data.listing_id))
         rental_id = cur.fetchone()["id"]
-        # link thread
         cur.execute("UPDATE message_threads SET rental_id=%s WHERE thread_id=%s", (rental_id, thread_id))
         conn.commit()
 
@@ -724,7 +786,7 @@ async def stripe_webhook(request: Request):
     return PlainTextResponse("ok")
 
 # -----------------------------
-# Approve / Decline
+# Approve / Decline via API (authenticated)
 # -----------------------------
 @app.post("/rentals/{rental_id}/approve")
 def approve_rental(rental_id: uuid.UUID, user=Depends(get_current_user)):
@@ -787,7 +849,8 @@ def login_admin(data: LoginIn):
 
 @app.get("/admin/all-rental-requests")
 def admin_all_rentals(user=Depends(get_current_user)):
-    admin_guard(user)
+    if not user.get("is_admin"):
+        raise HTTPException(403, "Admin only")
     with get_conn() as conn, conn.cursor(cursor_factory=psycopg2.extras.DictCursor) as cur:
         cur.execute("""
             SELECT r.id, r.listing_id, r.renter_email, r.amount_total, r.currency,
@@ -824,6 +887,8 @@ def root():
 @app.get("/healthz")
 def healthz():
     return PlainTextResponse("ok")
+
+
 
 
 
