@@ -1,6 +1,6 @@
-# main.py — Rentonomic API (full, with UUID adapter fix)
-# - CORS locked to rentonomic.com
-# - SendGrid US/EU supported via SENDGRID_API_HOST (auto-fallback to EU on 401)
+# main.py — Rentonomic API (full, with CORS regex + UUID adapter)
+# - CORS regex allows rentonomic.com, subdomains, netlify.app, localhost
+# - SendGrid US/EU via SENDGRID_API_HOST (auto-fallback to EU on 401)
 # - Masked emails in notifications + dashboard
 # - Message threads + chat (locked until paid)
 # - Request-to-Rent flow (emails, thread auto-create)
@@ -14,7 +14,7 @@ import base64
 import hashlib
 import logging
 from datetime import datetime, timedelta
-from typing import Optional, List, Dict, Any
+from typing import Optional, List
 
 import psycopg2
 import psycopg2.extras
@@ -69,14 +69,12 @@ stripe.api_key = STRIPE_SECRET_KEY
 # -----------------------------
 # App + CORS
 # -----------------------------
-app = FastAPI(title="Rentonomic API", version="13.1")
+app = FastAPI(title="Rentonomic API", version="13.2")
 
+# Allow rentonomic.com, *.rentonomic.com, *.netlify.app, localhost (any port)
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[
-        "https://rentonomic.com",
-        "https://www.rentonomic.com",
-    ],
+    allow_origin_regex=r"^https?://(localhost(:\d+)?|127\.0\.0\.1(:\d+)?|([a-z0-9-]+\.)?rentonomic\.com|([a-z0-9-]+\.)?netlify\.app)$",
     allow_credentials=True,
     allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],
     allow_headers=["Authorization", "Content-Type", "Stripe-Signature", "*"],
@@ -93,13 +91,6 @@ logging.basicConfig(level=logging.INFO)
 # -----------------------------
 def get_conn():
     return psycopg2.connect(DATABASE_URL, sslmode="require")
-
-def col_exists(cur, table: str, col: str) -> bool:
-    cur.execute("""
-      SELECT 1 FROM information_schema.columns
-      WHERE table_name=%s AND column_name=%s
-    """, (table, col))
-    return cur.fetchone() is not None
 
 # -----------------------------
 # Models
@@ -603,8 +594,7 @@ def send_rent_request_email(listing_name: str, lister_email: str, renter_email: 
         <p style="color:#555;font-size:12px">For privacy, renter emails are masked. Chat happens inside your Rentonomic dashboard.</p>
       </div>
     """
-    send_rent_request_html = html
-    send_email_html(lister_email, f"Rental enquiry — {listing_name}", send_rent_request_html)
+    send_email_html(lister_email, f"Rental enquiry — {listing_name}", html)
 
 @app.post("/request-to-rent")
 def request_to_rent(data: RentRequestIn, user=Depends(get_current_user)):
@@ -834,6 +824,8 @@ def root():
 @app.get("/healthz")
 def healthz():
     return PlainTextResponse("ok")
+
+
 
 
 
