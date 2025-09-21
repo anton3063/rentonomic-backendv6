@@ -1,11 +1,12 @@
-# main.py — Rentonomic API (full rewrite, production-safe)
+# main.py — Rentonomic API (full, with UUID adapter fix)
 # - CORS locked to rentonomic.com
 # - SendGrid US/EU supported via SENDGRID_API_HOST (auto-fallback to EU on 401)
 # - Masked emails in notifications + dashboard
 # - Message threads + chat (locked until paid)
 # - Request-to-Rent flow (emails, thread auto-create)
 # - Stripe checkout + webhook unlocks thread and marks rental paid
-# - Minimal, idempotent migrations
+# - Idempotent migrations
+# - UUID adapter fix for psycopg2 ("can't adapt type 'UUID'")
 
 import os
 import uuid
@@ -17,6 +18,13 @@ from typing import Optional, List, Dict, Any
 
 import psycopg2
 import psycopg2.extras
+
+# === UUID adapter fix (prevents "can't adapt type 'UUID'") ===
+from psycopg2.extensions import register_adapter, AsIs
+import uuid as _uuid
+def _adapt_uuid(u: _uuid.UUID): return AsIs(f"'{u}'::uuid")
+register_adapter(_uuid.UUID, _adapt_uuid)
+
 from fastapi import FastAPI, Depends, HTTPException, UploadFile, File, Form, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, PlainTextResponse
@@ -61,7 +69,7 @@ stripe.api_key = STRIPE_SECRET_KEY
 # -----------------------------
 # App + CORS
 # -----------------------------
-app = FastAPI(title="Rentonomic API", version="13.0")
+app = FastAPI(title="Rentonomic API", version="13.1")
 
 app.add_middleware(
     CORSMiddleware,
@@ -595,7 +603,8 @@ def send_rent_request_email(listing_name: str, lister_email: str, renter_email: 
         <p style="color:#555;font-size:12px">For privacy, renter emails are masked. Chat happens inside your Rentonomic dashboard.</p>
       </div>
     """
-    send_email_html(lister_email, f"Rental enquiry — {listing_name}", html)
+    send_rent_request_html = html
+    send_email_html(lister_email, f"Rental enquiry — {listing_name}", send_rent_request_html)
 
 @app.post("/request-to-rent")
 def request_to_rent(data: RentRequestIn, user=Depends(get_current_user)):
@@ -825,6 +834,8 @@ def root():
 @app.get("/healthz")
 def healthz():
     return PlainTextResponse("ok")
+
+
 
 
 
