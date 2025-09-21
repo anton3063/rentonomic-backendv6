@@ -22,7 +22,7 @@ import cloudinary.uploader as cu
 
 # SendGrid
 from sendgrid import SendGridAPIClient
-from sendgrid.helpers.mail import Mail
+from sendgrid.helpers.mail import Mail, MailSettings, ClickTracking  # <— add mail settings
 
 # Stripe
 import stripe
@@ -47,7 +47,7 @@ if CLOUDINARY_URL:
 
 STRIPE_SECRET_KEY = os.getenv("STRIPE_SECRET_KEY")
 STRIPE_WEBHOOK_SECRET = os.getenv("STRIPE_WEBHOOK_SECRET")
-FRONTEND_URL = os.getenv("FRONTEND_URL", "https://rentonomic.netlify.app")
+FRONTEND_URL = os.getenv("FRONTEND_URL", "https://rentonomic.netlify.app")  # set to https://rentonomic.com if preferred
 CURRENCY = os.getenv("CURRENCY", "gbp")
 PLATFORM_FEE_PERCENT = float(os.getenv("PLATFORM_FEE_PERCENT", "10"))
 
@@ -218,6 +218,14 @@ def listing_public_shape(row: Dict[str, Any]) -> Dict[str, Any]:
         "image_url": row.get("image_url") or "",
         "created_at": row.get("created_at").isoformat() if row.get("created_at") else None,
     }
+
+# --- NEW: mask email for notifications ---
+def mask_email(e: str) -> str:
+    try:
+        name, dom = e.split("@", 1)
+        return f"{name[0]}******@{dom}"
+    except Exception:
+        return e
 
 # -----------------------------
 # Models
@@ -514,14 +522,42 @@ def request_to_rent(body: RentRequestIn, current_user: Dict[str, Any] = Depends(
     if not lister_email:
         raise HTTPException(status_code=400, detail="Listing has no owner email on record")
 
+    # Build masked details + review link
+    dates_list = body.dates or []
     message_text = body.message or "Is your item available for rent on this/these days?"
-    date_str = ", ".join(body.dates) if body.dates else "(no dates provided)"
+    date_str = ", ".join(dates_list) if dates_list else "(no dates provided)"
+    renter_masked = mask_email(current_user["email"])
+
+    # For Step 1 we don’t yet have a persistent request id; link to dashboard with listing preselected
+    review_url = f"{FRONTEND_URL.rstrip('/')}/dashboard.html?listing={listing['id']}&action=review"
+
+    subject = f"New rental request — {listing['name']}"
+
+    plain = (
+        "Hi,\n\n"
+        f"You’ve received a rental request for '{listing['name']}' ({listing['location']}).\n\n"
+        f"Renter: {renter_masked}\n"
+        f"Dates: {date_str}\n"
+        f"Message: {message_text}\n\n"
+        f"Open in Rentonomic to review: {review_url}\n\n"
+        "— Rentonomic"
+    )
+
     html_body = f"""
-    <p><strong>New rent request</strong></p>
-    <p>Item: {listing['name']} ({listing['location']})</p>
-    <p>Requested dates: {date_str}</p>
-    <p>Message: {message_text}</p>
-    <p>From: {current_user['email']}</p>
+    <p>Hi,</p>
+    <p>You’ve received a rental request for <strong>{listing['name']}</strong> ({listing['location']}).</p>
+    <p><strong>Renter:</strong> {renter_masked}<br/>
+       <strong>Dates:</strong> {date_str}<br/>
+       <strong>Message:</strong> {message_text}</p>
+    <p>
+      <a href="{review_url}" style="background:#16a34a;color:#fff;padding:10px 14px;border-radius:6px;text-decoration:none;">
+        Open in Rentonomic to Approve/Decline
+      </a>
+    </p>
+    <p style="color:#666;font-size:12px;margin-top:16px;">
+      If the button doesn’t open, copy and paste this link:<br/>
+      {review_url}
+    </p>
     """
 
     if not SENDGRID_API_KEY:
@@ -530,8 +566,18 @@ def request_to_rent(body: RentRequestIn, current_user: Dict[str, Any] = Depends(
 
     try:
         sg = SendGridAPIClient(SENDGRID_API_KEY)
-        mail = Mail(from_email=SENDGRID_FROM, to_emails=lister_email,
-                    subject="Rentonomic — New Rental Request", html_content=html_body)
+        mail = Mail(
+            from_email=SENDGRID_FROM,
+            to_emails=lister_email,
+            subject=subject,
+            plain_text_content=plain,   # add text/plain for deliverability
+            html_content=html_body
+        )
+        # Lower spam score: disable click tracking for this message
+        ms = MailSettings()
+        ms.click_tracking = ClickTracking(False, False)
+        mail.mail_settings = ms
+
         resp = sg.send(mail)
         return {"ok": True, "sent": True, "status_code": resp.status_code}
     except Exception as e:
@@ -884,6 +930,8 @@ async def stripe_webhook(request: Request):
         return JSONResponse(status_code=500, content={"error": "Webhook handler error"})
 
     return PlainTextResponse("ok", status_code=200)
+
+
 
 
 
