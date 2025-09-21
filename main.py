@@ -1,11 +1,8 @@
-# main.py — Rentonomic API (v14.3)
-# - Fix: support legacy base64-SHA256 password hashes + upgrade-to-hex on login
-# - Login/Signup accept JSON OR form
-# - Permissive CORS (temporary)
-# - UUID adapter fix
-# - Request-to-rent with Approve/Decline signed links
-# - Stripe webhook unlocks threads
-# - Threads/messages APIs
+# main.py — Rentonomic API (v14.4)
+# - Robust login parsing: tries JSON → form → URL-encoded fallback
+# - Supports legacy sha256(base64) and canonical sha256(hex); auto-upgrades to hex
+# - Optional DEBUG_LOGIN env var prints clear reasons to logs (no password leakage)
+# - Keeps all existing endpoints/flows (listings, threads/messages, request-to-rent, Stripe webhook)
 import os
 import uuid
 import base64
@@ -61,12 +58,14 @@ STRIPE_WEBHOOK_SECRET = os.getenv("STRIPE_WEBHOOK_SECRET")
 FRONTEND_URL = os.getenv("FRONTEND_URL", "https://rentonomic.com")
 BACKEND_URL = os.getenv("BACKEND_URL", "https://rentonomic-backend.onrender.com")
 
+DEBUG_LOGIN = (os.getenv("DEBUG_LOGIN", "true").lower() == "true")
+
 stripe.api_key = STRIPE_SECRET_KEY
 
 # -----------------------------
 # App + CORS
 # -----------------------------
-app = FastAPI(title="Rentonomic API", version="14.3")
+app = FastAPI(title="Rentonomic API", version="14.4")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -167,15 +166,23 @@ def sha256_b64(pw: str) -> str:
     return base64.b64encode(hashlib.sha256(pw.encode()).digest()).decode()
 
 def is_hex64(s: str) -> bool:
-    return len(s) == 64 and all(c in "0123456789abcdef" for c in s)
+    if len(s) != 64: return False
+    for c in s:
+        if c not in "0123456789abcdef":
+            return False
+    return True
 
 def is_b64_32bytes(s: str) -> bool:
-    # quick check for legacy: base64 decoding yields 32 bytes
     try:
         b = base64.b64decode(s)
         return len(b) == 32
     except Exception:
         return False
+
+def classify_hash(s: str) -> str:
+    if is_hex64(s): return "sha256-hex"
+    if is_b64_32bytes(s): return "sha256-b64"
+    return "unknown"
 
 def verify_password(stored: str, candidate: str) -> bool:
     # support both sha256-hex and legacy sha256-b64
@@ -183,16 +190,16 @@ def verify_password(stored: str, candidate: str) -> bool:
         return stored == sha256_hex(candidate)
     if is_b64_32bytes(stored):
         return stored == sha256_b64(candidate)
-    # fallback try both (in case of weird data)
+    # fallback: try both anyway
     return stored in (sha256_hex(candidate), sha256_b64(candidate))
 
 def maybe_upgrade_password_hash(user_id: uuid.UUID, stored: str, candidate: str):
-    # If stored is legacy base64 and candidate matches, rewrite to hex
     if is_b64_32bytes(stored) and stored == sha256_b64(candidate):
         new_hash = sha256_hex(candidate)
         with get_conn() as conn, conn.cursor() as cur:
             cur.execute("UPDATE users SET password_hash=%s WHERE id=%s", (new_hash, user_id))
             conn.commit()
+        logging.info("Upgraded password hash for user %s from sha256-b64 to sha256-hex", user_id)
 
 # -----------------------------
 # Migrations
@@ -309,29 +316,61 @@ def send_email_html(to_addr: str, subject: str, html: str):
         raise HTTPException(500, "Failed to send email")
 
 # -----------------------------
-# Auth (JSON OR form) + legacy compat
+# Robust body parsing for auth
 # -----------------------------
-def _extract_email_password_sync(request: Request):
-    ct = (request.headers.get("content-type") or "").lower()
-    return "json" if "application/json" in ct else "form"
-
-@app.post("/signup")
-async def signup(request: Request):
-    mode = _extract_email_password_sync(request)
-    if mode == "json":
+async def _parse_auth_body(request: Request):
+    """
+    Tries JSON → form → urlencoded body in that order.
+    Returns (email, password, mode) where mode is 'json'|'form'|'urlencoded'|'unknown'
+    """
+    # 1) Try JSON
+    try:
         data = await request.json()
         email = str(data.get("email", "")).lower().strip()
-        password = data.get("password", "")
-    else:
+        password = data.get("password", "") or ""
+        if email or password:
+            return email, password, "json"
+    except Exception:
+        pass
+    # 2) Try form
+    try:
         form = await request.form()
         email = str((form.get("email") or "")).lower().strip()
-        password = form.get("password") or ""
+        password = (form.get("password") or "")
+        if email or password:
+            return email, password, "form"
+    except Exception:
+        pass
+    # 3) Try raw urlencoded (some clients send text/plain)
+    try:
+        raw = (await request.body()).decode(errors="ignore")
+        # naive parse: a=b&c=d
+        pairs = [p for p in raw.split("&") if "=" in p]
+        parsed = {}
+        for p in pairs:
+            k, v = p.split("=", 1)
+            parsed[k.strip()] = v.strip()
+        email = str(parsed.get("email", "")).lower().strip()
+        password = parsed.get("password", "") or ""
+        if email or password:
+            return email, password, "urlencoded"
+    except Exception:
+        pass
+    return "", "", "unknown"
+
+# -----------------------------
+# Auth endpoints
+# -----------------------------
+@app.post("/signup")
+async def signup(request: Request):
+    email, password, mode = await _parse_auth_body(request)
+    if DEBUG_LOGIN:
+        logging.info("[/signup] mode=%s email=%s", mode, email)
     if not email or not password:
         raise HTTPException(400, "Email and password required")
     if len(password) < 6:
         raise HTTPException(400, "Password too short")
-
-    pw_hash = sha256_hex(password)  # new canonical format
+    pw_hash = sha256_hex(password)  # canonical format
     with get_conn() as conn, conn.cursor(cursor_factory=psycopg2.extras.DictCursor) as cur:
         cur.execute("SELECT id FROM users WHERE lower(email)=lower(%s)", (email,))
         if cur.fetchone():
@@ -343,33 +382,28 @@ async def signup(request: Request):
 
 @app.post("/login")
 async def login(request: Request):
-    mode = _extract_email_password_sync(request)
-    if mode == "json":
-        data = await request.json()
-        email = str(data.get("email", "")).lower().strip()
-        password = data.get("password", "")
-    else:
-        form = await request.form()
-        email = str((form.get("email") or "")).lower().strip()
-        password = form.get("password") or ""
-
+    email, password, mode = await _parse_auth_body(request)
+    if DEBUG_LOGIN:
+        logging.info("[/login] mode=%s email=%s", mode, email)
     if not email or not password:
+        if DEBUG_LOGIN: logging.info("[/login] missing fields (email/password)")
         raise HTTPException(400, "Email and password required")
-
     with get_conn() as conn, conn.cursor(cursor_factory=psycopg2.extras.DictCursor) as cur:
         cur.execute("SELECT id, is_admin, password_hash FROM users WHERE lower(email)=lower(%s)", (email,))
         row = cur.fetchone()
         if not row:
+            if DEBUG_LOGIN: logging.info("[/login] user not found: %s", email)
             raise HTTPException(401, "Invalid email or password")
-        if not verify_password(row["password_hash"], password):
+        stored = row["password_hash"] or ""
+        scheme = classify_hash(stored)
+        if DEBUG_LOGIN: logging.info("[/login] stored_scheme=%s", scheme)
+        if not verify_password(stored, password):
+            if DEBUG_LOGIN: logging.info("[/login] password mismatch")
             raise HTTPException(401, "Invalid email or password")
-
-        # upgrade legacy base64 → hex
         try:
-            maybe_upgrade_password_hash(uuid.UUID(str(row["id"])), row["password_hash"], password)
+            maybe_upgrade_password_hash(uuid.UUID(str(row["id"])), stored, password)
         except Exception as e:
-            logging.warning("Password upgrade skipped: %s", e)
-
+            logging.warning("[/login] upgrade skipped: %s", e)
         token = make_token(str(row["id"]), email, is_admin=row["is_admin"])
     return {"token": token}
 
@@ -822,6 +856,8 @@ def root():
 @app.get("/healthz")
 def healthz():
     return PlainTextResponse("ok")
+
+
 
 
 
