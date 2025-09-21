@@ -1,8 +1,11 @@
-# main.py — Rentonomic API (v14.4)
-# - Robust login parsing: tries JSON → form → URL-encoded fallback
-# - Supports legacy sha256(base64) and canonical sha256(hex); auto-upgrades to hex
-# - Optional DEBUG_LOGIN env var prints clear reasons to logs (no password leakage)
-# - Keeps all existing endpoints/flows (listings, threads/messages, request-to-rent, Stripe webhook)
+# main.py — Rentonomic API (v14.5)
+# - Auth compatible with legacy PBKDF2-SHA256 (base64) and SHA256 (hex/base64)
+# - PBKDF2 kept as canonical; auto-upgrade non-PBKDF2 hashes on login
+# - /login & /signup accept JSON, form, or urlencoded bodies
+# - Tokens: sub=email (legacy-compatible) + uid + is_admin
+# - get_current_user loads DB row by email (legacy-compatible)
+# - Keeps UUID adapter, CORS, listings, threads, request-to-rent, Stripe webhook, SendGrid email
+
 import os
 import uuid
 import base64
@@ -10,7 +13,7 @@ import hashlib
 import hmac
 import logging
 from datetime import datetime, timedelta
-from typing import Optional, List
+from typing import Optional, List, Dict, Any
 
 import psycopg2
 import psycopg2.extras
@@ -58,6 +61,10 @@ STRIPE_WEBHOOK_SECRET = os.getenv("STRIPE_WEBHOOK_SECRET")
 FRONTEND_URL = os.getenv("FRONTEND_URL", "https://rentonomic.com")
 BACKEND_URL = os.getenv("BACKEND_URL", "https://rentonomic-backend.onrender.com")
 
+# Legacy hashing settings
+PW_SALT = os.getenv("PW_SALT", "rentonomic-salt")
+PW_ITER = int(os.getenv("PW_ITER", "120000"))
+
 DEBUG_LOGIN = (os.getenv("DEBUG_LOGIN", "true").lower() == "true")
 
 stripe.api_key = STRIPE_SECRET_KEY
@@ -65,7 +72,7 @@ stripe.api_key = STRIPE_SECRET_KEY
 # -----------------------------
 # App + CORS
 # -----------------------------
-app = FastAPI(title="Rentonomic API", version="14.4")
+app = FastAPI(title="Rentonomic API", version="14.5")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -110,7 +117,7 @@ class CheckoutIn(BaseModel):
     dates: List[str]
 
 # -----------------------------
-# JWT helpers
+# JWT (HMAC) helpers
 # -----------------------------
 def _b64url(b: bytes) -> str:
     return base64.urlsafe_b64encode(b).rstrip(b"=").decode()
@@ -144,13 +151,29 @@ def jwt_decode(token: str, secret: str) -> dict:
     except Exception:
         raise HTTPException(status_code=401, detail="Invalid token")
 
-def make_token(sub: str, email: str, is_admin: bool = False) -> str:
+def make_token(user_id: uuid.UUID, email: str, is_admin: bool = False) -> str:
     exp = int((datetime.utcnow() + timedelta(minutes=JWT_EXP_MIN)).timestamp())
-    payload = {"sub": sub, "email": email, "is_admin": is_admin, "exp": exp, "iat": int(datetime.utcnow().timestamp())}
+    payload = {
+        "sub": email,          # legacy-compatible
+        "uid": str(user_id),   # convenience
+        "email": email,
+        "is_admin": is_admin,
+        "exp": exp,
+        "iat": int(datetime.utcnow().timestamp()),
+    }
     return jwt_encode(payload, JWT_SECRET)
 
-def get_current_user(creds: HTTPAuthorizationCredentials = Depends(security)):
-    return jwt_decode(creds.credentials, JWT_SECRET)
+def get_current_user(creds: HTTPAuthorizationCredentials = Depends(security)) -> Dict[str, Any]:
+    tok = jwt_decode(creds.credentials, JWT_SECRET)
+    email = (tok.get("email") or tok.get("sub") or "").lower().strip()
+    if not email:
+        raise HTTPException(401, "Invalid token payload")
+    with get_conn() as conn, conn.cursor(cursor_factory=psycopg2.extras.DictCursor) as cur:
+        cur.execute("SELECT id, email, COALESCE(is_admin, FALSE) AS is_admin FROM users WHERE lower(email)=%s", (email,))
+        row = cur.fetchone()
+        if not row:
+            raise HTTPException(401, "User not found")
+        return {"id": row["id"], "email": row["email"], "is_admin": bool(row["is_admin"])}
 
 def admin_guard(user: dict):
     if not user.get("is_admin"):
@@ -165,44 +188,45 @@ def sha256_hex(pw: str) -> str:
 def sha256_b64(pw: str) -> str:
     return base64.b64encode(hashlib.sha256(pw.encode()).digest()).decode()
 
-def is_hex64(s: str) -> bool:
-    if len(s) != 64: return False
-    for c in s:
-        if c not in "0123456789abcdef":
-            return False
-    return True
+def pbkdf2_b64(pw: str) -> str:
+    return base64.b64encode(hashlib.pbkdf2_hmac("sha256", pw.encode(), PW_SALT.encode(), PW_ITER)).decode()
 
-def is_b64_32bytes(s: str) -> bool:
+def is_hex64(s: str) -> bool:
+    return len(s) == 64 and all(c in "0123456789abcdef" for c in s)
+
+def looks_base64_32bytes(s: str) -> bool:
     try:
         b = base64.b64decode(s)
         return len(b) == 32
     except Exception:
         return False
 
-def classify_hash(s: str) -> str:
-    if is_hex64(s): return "sha256-hex"
-    if is_b64_32bytes(s): return "sha256-b64"
-    return "unknown"
+def verify_password(stored: str, candidate: str) -> str:
+    """
+    Try PBKDF2-b64 (legacy), then SHA256-hex, then SHA256-b64.
+    Return the scheme string that matched: 'pbkdf2-b64' | 'sha256-hex' | 'sha256-b64' | ''.
+    """
+    if stored == pbkdf2_b64(candidate):
+        return "pbkdf2-b64"
+    if is_hex64(stored) and stored == sha256_hex(candidate):
+        return "sha256-hex"
+    if looks_base64_32bytes(stored) and stored == sha256_b64(candidate):
+        return "sha256-b64"
+    return ""
 
-def verify_password(stored: str, candidate: str) -> bool:
-    # support both sha256-hex and legacy sha256-b64
-    if is_hex64(stored):
-        return stored == sha256_hex(candidate)
-    if is_b64_32bytes(stored):
-        return stored == sha256_b64(candidate)
-    # fallback: try both anyway
-    return stored in (sha256_hex(candidate), sha256_b64(candidate))
-
-def maybe_upgrade_password_hash(user_id: uuid.UUID, stored: str, candidate: str):
-    if is_b64_32bytes(stored) and stored == sha256_b64(candidate):
-        new_hash = sha256_hex(candidate)
+def maybe_upgrade_password_hash(user_id: uuid.UUID, matched_scheme: str, candidate: str):
+    """
+    If a weaker non-PBKDF2 scheme matched, rewrite to PBKDF2-b64.
+    """
+    if matched_scheme and matched_scheme != "pbkdf2-b64":
+        new_hash = pbkdf2_b64(candidate)
         with get_conn() as conn, conn.cursor() as cur:
             cur.execute("UPDATE users SET password_hash=%s WHERE id=%s", (new_hash, user_id))
             conn.commit()
-        logging.info("Upgraded password hash for user %s from sha256-b64 to sha256-hex", user_id)
+        logging.info("Upgraded password hash for user %s from %s to pbkdf2-b64", user_id, matched_scheme)
 
 # -----------------------------
-# Migrations
+# Migrations (idempotent)
 # -----------------------------
 def migrate():
     with get_conn() as conn:
@@ -316,14 +340,10 @@ def send_email_html(to_addr: str, subject: str, html: str):
         raise HTTPException(500, "Failed to send email")
 
 # -----------------------------
-# Robust body parsing for auth
+# Body parsing for auth
 # -----------------------------
 async def _parse_auth_body(request: Request):
-    """
-    Tries JSON → form → urlencoded body in that order.
-    Returns (email, password, mode) where mode is 'json'|'form'|'urlencoded'|'unknown'
-    """
-    # 1) Try JSON
+    # 1) JSON
     try:
         data = await request.json()
         email = str(data.get("email", "")).lower().strip()
@@ -332,7 +352,7 @@ async def _parse_auth_body(request: Request):
             return email, password, "json"
     except Exception:
         pass
-    # 2) Try form
+    # 2) form
     try:
         form = await request.form()
         email = str((form.get("email") or "")).lower().strip()
@@ -341,10 +361,9 @@ async def _parse_auth_body(request: Request):
             return email, password, "form"
     except Exception:
         pass
-    # 3) Try raw urlencoded (some clients send text/plain)
+    # 3) raw urlencoded
     try:
         raw = (await request.body()).decode(errors="ignore")
-        # naive parse: a=b&c=d
         pairs = [p for p in raw.split("&") if "=" in p]
         parsed = {}
         for p in pairs:
@@ -364,27 +383,25 @@ async def _parse_auth_body(request: Request):
 @app.post("/signup")
 async def signup(request: Request):
     email, password, mode = await _parse_auth_body(request)
-    if DEBUG_LOGIN:
-        logging.info("[/signup] mode=%s email=%s", mode, email)
+    if DEBUG_LOGIN: logging.info("[/signup] mode=%s email=%s", mode, email)
     if not email or not password:
         raise HTTPException(400, "Email and password required")
     if len(password) < 6:
         raise HTTPException(400, "Password too short")
-    pw_hash = sha256_hex(password)  # canonical format
+    pw_hash = pbkdf2_b64(password)  # canonical (legacy-compatible)
     with get_conn() as conn, conn.cursor(cursor_factory=psycopg2.extras.DictCursor) as cur:
         cur.execute("SELECT id FROM users WHERE lower(email)=lower(%s)", (email,))
         if cur.fetchone():
             raise HTTPException(400, "Email already registered")
         cur.execute("INSERT INTO users(email, password_hash) VALUES (%s,%s) RETURNING id, is_admin", (email, pw_hash))
         row = cur.fetchone()
-        token = make_token(str(row["id"]), email, is_admin=row["is_admin"])
+        token = make_token(row["id"], email, is_admin=row["is_admin"])
     return {"token": token}
 
 @app.post("/login")
 async def login(request: Request):
     email, password, mode = await _parse_auth_body(request)
-    if DEBUG_LOGIN:
-        logging.info("[/login] mode=%s email=%s", mode, email)
+    if DEBUG_LOGIN: logging.info("[/login] mode=%s email=%s", mode, email)
     if not email or not password:
         if DEBUG_LOGIN: logging.info("[/login] missing fields (email/password)")
         raise HTTPException(400, "Email and password required")
@@ -395,21 +412,20 @@ async def login(request: Request):
             if DEBUG_LOGIN: logging.info("[/login] user not found: %s", email)
             raise HTTPException(401, "Invalid email or password")
         stored = row["password_hash"] or ""
-        scheme = classify_hash(stored)
-        if DEBUG_LOGIN: logging.info("[/login] stored_scheme=%s", scheme)
-        if not verify_password(stored, password):
-            if DEBUG_LOGIN: logging.info("[/login] password mismatch")
+        matched = verify_password(stored, password)
+        if not matched:
+            if DEBUG_LOGIN: logging.info("[/login] password mismatch (stored starts with: %s...)", stored[:8])
             raise HTTPException(401, "Invalid email or password")
         try:
-            maybe_upgrade_password_hash(uuid.UUID(str(row["id"])), stored, password)
+            maybe_upgrade_password_hash(row["id"], matched, password)
         except Exception as e:
             logging.warning("[/login] upgrade skipped: %s", e)
-        token = make_token(str(row["id"]), email, is_admin=row["is_admin"])
+        token = make_token(row["id"], email, is_admin=row["is_admin"])
     return {"token": token}
 
 @app.get("/me")
-def me(user=Depends(get_current_user)):
-    return user
+def me(current_user=Depends(get_current_user)):
+    return {"email": current_user["email"], "id": str(current_user["id"]), "is_admin": current_user["is_admin"]}
 
 # -----------------------------
 # Listings
@@ -442,16 +458,16 @@ def get_listings():
         ]
 
 @app.get("/my-listings")
-def my_listings(user=Depends(get_current_user)):
-    uid = user["sub"]
-    email = user.get("email", "").lower()
+def my_listings(current_user=Depends(get_current_user)):
+    uid = current_user["id"]
+    email = current_user.get("email", "").lower()
     with get_conn() as conn, conn.cursor(cursor_factory=psycopg2.extras.DictCursor) as cur:
         cur.execute("""
             SELECT id, owner_id, owner_email, name, location, description, price_per_day, image_url, created_at
             FROM listings
             WHERE owner_id = %s OR lower(owner_email) = %s
             ORDER BY created_at DESC
-        """, (uuid.UUID(uid), email))
+        """, (uid, email))
         rows = cur.fetchall()
         return [
             {
@@ -469,10 +485,10 @@ def create_listing(
     description: str = Form(...),
     price_per_day: float = Form(...),
     image: UploadFile = File(None),
-    user=Depends(get_current_user),
+    current_user=Depends(get_current_user),
 ):
-    owner_id = uuid.UUID(user["sub"])
-    owner_email = user.get("email")
+    owner_id = current_user["id"]
+    owner_email = current_user.get("email")
     image_url = None
     if image and CLOUDINARY_URL:
         up = cloudinary.uploader.upload(image.file, folder="rentonomic/listings")
@@ -495,7 +511,7 @@ def update_listing(
     description: Optional[str] = Form(None),
     price_per_day: Optional[float] = Form(None),
     image: UploadFile = File(None),
-    user=Depends(get_current_user)
+    current_user=Depends(get_current_user)
 ):
     with get_conn() as conn, conn.cursor() as cur:
         if image and CLOUDINARY_URL:
@@ -514,9 +530,12 @@ def update_listing(
     return {"ok": True}
 
 @app.delete("/listings/{listing_id}")
-def delete_listing(listing_id: uuid.UUID, user=Depends(get_current_user)):
+def delete_listing(listing_id: uuid.UUID, current_user=Depends(get_current_user)):
     with get_conn() as conn, conn.cursor() as cur:
-        cur.execute("DELETE FROM listings WHERE id=%s", (listing_id,))
+        cur.execute("DELETE FROM listings WHERE id=%s AND owner_id=%s RETURNING id", (listing_id, current_user["id"]))
+        row = cur.fetchone()
+        if not row:
+            raise HTTPException(404, "Listing not found or not owned by user")
         conn.commit()
     return {"ok": True}
 
@@ -524,8 +543,8 @@ def delete_listing(listing_id: uuid.UUID, user=Depends(get_current_user)):
 # Threads & messages
 # -----------------------------
 @app.get("/message-threads")
-def list_threads(user=Depends(get_current_user)):
-    uid = uuid.UUID(user["sub"])
+def list_threads(current_user=Depends(get_current_user)):
+    uid = current_user["id"]
     with get_conn() as conn, conn.cursor(cursor_factory=psycopg2.extras.DictCursor) as cur:
         cur.execute("""
             SELECT t.thread_id, t.listing_id, t.rental_id, t.lister_id, t.renter_id,
@@ -555,8 +574,8 @@ def list_threads(user=Depends(get_current_user)):
         return out
 
 @app.get("/threads/{thread_id}")
-def get_thread(thread_id: uuid.UUID, user=Depends(get_current_user)):
-    uid = uuid.UUID(user["sub"])
+def get_thread(thread_id: uuid.UUID, current_user=Depends(get_current_user)):
+    uid = current_user["id"]
     with get_conn() as conn, conn.cursor(cursor_factory=psycopg2.extras.DictCursor) as cur:
         cur.execute("""
             SELECT t.thread_id, t.lister_id, t.renter_id, t.is_unlocked, t.status
@@ -578,15 +597,18 @@ def get_thread(thread_id: uuid.UUID, user=Depends(get_current_user)):
             "is_unlocked": bool(th["is_unlocked"]),
             "status": th["status"],
             "messages": [
-                {"id": str(m["id"]), "sender_id": str(m["sender_id"]) if m["sender_id"] else None,
-                 "body": m["body"], "created_at": m["created_at"].isoformat()}
-                for m in msgs
+                {
+                    "id": str(m["id"]),
+                    "sender_id": str(m["sender_id"]) if m["sender_id"] else None,
+                    "body": m["body"],
+                    "created_at": m["created_at"].isoformat(),
+                } for m in msgs
             ],
         }
 
 @app.post("/threads/{thread_id}/message")
-def post_message(thread_id: uuid.UUID, data: MessageIn, user=Depends(get_current_user)):
-    uid = uuid.UUID(user["sub"])
+def post_message(thread_id: uuid.UUID, data: MessageIn, current_user=Depends(get_current_user)):
+    uid = current_user["id"]
     with get_conn() as conn, conn.cursor(cursor_factory=psycopg2.extras.DictCursor) as cur:
         cur.execute("""
             SELECT is_unlocked FROM message_threads
@@ -609,7 +631,7 @@ def post_message(thread_id: uuid.UUID, data: MessageIn, user=Depends(get_current
 # Request to Rent (+ email actions)
 # -----------------------------
 def create_or_get_thread_for_listing(listing_id: uuid.UUID, current_user: dict, start_date: Optional[str], end_date: Optional[str]) -> uuid.UUID:
-    uid = uuid.UUID(current_user["sub"])
+    uid = current_user["id"]
     with get_conn() as conn, conn.cursor(cursor_factory=psycopg2.extras.DictCursor) as cur:
         cur.execute("SELECT id, owner_id, owner_email, name FROM listings WHERE id=%s", (listing_id,))
         lst = cur.fetchone()
@@ -680,7 +702,7 @@ def send_rent_request_email_with_actions(listing_name: str, lister_email: str, r
     send_email_html(lister_email, f"Rental enquiry — {listing_name}", html)
 
 @app.post("/request-to-rent")
-def request_to_rent(data: RentRequestIn, user=Depends(get_current_user)):
+def request_to_rent(data: RentRequestIn, current_user=Depends(get_current_user)):
     dates = data.dates or []
     if not dates:
         raise HTTPException(422, "Dates array required")
@@ -693,8 +715,8 @@ def request_to_rent(data: RentRequestIn, user=Depends(get_current_user)):
             raise HTTPException(404, "Listing not found")
         listing_name = lst["name"]
         lister_email = lst["owner_email"]
-    thread_id = create_or_get_thread_for_listing(data.listing_id, user, start_date, end_date)
-    send_rent_request_email_with_actions(listing_name, lister_email, user.get("email"), thread_id, start_date, end_date)
+    thread_id = create_or_get_thread_for_listing(data.listing_id, current_user, start_date, end_date)
+    send_rent_request_email_with_actions(listing_name, lister_email, current_user.get("email"), thread_id, start_date, end_date)
     with get_conn() as conn, conn.cursor() as cur:
         cur.execute("INSERT INTO messages(thread_id, sender_id, body) VALUES (%s,%s,%s)",
                     (thread_id, None, f"Rental request for {start_date} → {end_date}"))
@@ -739,14 +761,14 @@ def action_decline(tid: uuid.UUID = Query(...), token: str = Query(...)):
 # Stripe checkout + webhook
 # -----------------------------
 @app.post("/create-checkout-session")
-def create_checkout_session(data: CheckoutIn, user=Depends(get_current_user)):
+def create_checkout_session(data: CheckoutIn, current_user=Depends(get_current_user)):
     if not STRIPE_SECRET_KEY:
         raise HTTPException(500, "Stripe not configured")
     if not data.days or data.days < 1:
         raise HTTPException(400, "Invalid days")
     start_date = min(data.dates) if data.dates else None
     end_date = max(data.dates) if data.dates else None
-    thread_id = create_or_get_thread_for_listing(data.listing_id, user, start_date, end_date)
+    thread_id = create_or_get_thread_for_listing(data.listing_id, current_user, start_date, end_date)
     with get_conn() as conn, conn.cursor(cursor_factory=psycopg2.extras.DictCursor) as cur:
         cur.execute("""
             INSERT INTO rentals(listing_id, lister_id, renter_id, renter_email, amount_total, currency, status, start_date, end_date)
@@ -754,7 +776,7 @@ def create_checkout_session(data: CheckoutIn, user=Depends(get_current_user)):
             FROM listings l
             WHERE l.id=%s
             RETURNING id
-        """, (data.listing_id, uuid.UUID(user["sub"]), data.renter_email, data.amount_total, data.currency,
+        """, (data.listing_id, current_user["id"], data.renter_email, data.amount_total, data.currency,
               start_date, end_date, data.listing_id))
         rental_id = cur.fetchone()["id"]
         cur.execute("UPDATE message_threads SET rental_id=%s WHERE thread_id=%s", (rental_id, thread_id))
@@ -807,8 +829,8 @@ async def stripe_webhook(request: Request):
 # Approve/Decline (auth)
 # -----------------------------
 @app.post("/rentals/{rental_id}/approve")
-def approve_rental(rental_id: uuid.UUID, user=Depends(get_current_user)):
-    uid = uuid.UUID(user["sub"])
+def approve_rental(rental_id: uuid.UUID, current_user=Depends(get_current_user)):
+    uid = current_user["id"]
     with get_conn() as conn, conn.cursor(cursor_factory=psycopg2.extras.DictCursor) as cur:
         cur.execute("""
             SELECT r.id, r.listing_id, l.owner_id, t.thread_id
@@ -827,8 +849,8 @@ def approve_rental(rental_id: uuid.UUID, user=Depends(get_current_user)):
     return {"ok": True}
 
 @app.post("/rentals/{rental_id}/decline")
-def decline_rental(rental_id: uuid.UUID, user=Depends(get_current_user)):
-    uid = uuid.UUID(user["sub"])
+def decline_rental(rental_id: uuid.UUID, current_user=Depends(get_current_user)):
+    uid = current_user["id"]
     with get_conn() as conn, conn.cursor(cursor_factory=psycopg2.extras.DictCursor) as cur:
         cur.execute("""
             SELECT r.id, r.listing_id, l.owner_id, t.thread_id
@@ -856,6 +878,8 @@ def root():
 @app.get("/healthz")
 def healthz():
     return PlainTextResponse("ok")
+
+
 
 
 
