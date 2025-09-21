@@ -1,4 +1,4 @@
-# main.py — Rentonomic API (full rewrite, consolidated)
+# main.py — Rentonomic API (full, safe migrations)
 import os
 import uuid
 import base64
@@ -59,7 +59,7 @@ ADMIN_EMAIL = os.getenv("ADMIN_EMAIL", "admin@rentonomic.com").lower()
 # -----------------------------
 # App & CORS
 # -----------------------------
-app = FastAPI(title="Rentonomic API", version="13.0")
+app = FastAPI(title="Rentonomic API", version="13.1")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],  # tighten later
@@ -113,40 +113,33 @@ def migrate():
         CREATE TABLE IF NOT EXISTS rentals (
             id UUID PRIMARY KEY,
             listing_id UUID NOT NULL,
-            renter_id UUID NOT NULL,
-            renter_email TEXT NOT NULL,
-            days INTEGER NOT NULL DEFAULT 1,
-            amount_total INTEGER NOT NULL DEFAULT 0, -- pence
-            currency TEXT NOT NULL DEFAULT 'gbp',
+            renter_id UUID,
+            renter_email TEXT,
+            days INTEGER DEFAULT 1,
+            amount_total INTEGER DEFAULT 0, -- pence
+            currency TEXT DEFAULT 'gbp',
             checkout_session_id TEXT,
             payment_intent_id TEXT,
-            status TEXT NOT NULL DEFAULT 'pending',
+            status TEXT DEFAULT 'pending',
             start_date DATE,
             end_date DATE,
-            approved_by_lister BOOLEAN NOT NULL DEFAULT FALSE,
-            declined_by_lister BOOLEAN NOT NULL DEFAULT FALSE,
+            approved_by_lister BOOLEAN DEFAULT FALSE,
+            declined_by_lister BOOLEAN DEFAULT FALSE,
             created_at TIMESTAMP NOT NULL DEFAULT NOW()
         );
         """)
-        # Ensure columns exist if table predated
-        for col, ddl in [
-            ("renter_id", "ALTER TABLE rentals ADD COLUMN IF NOT EXISTS renter_id UUID NOT NULL DEFAULT gen_random_uuid()"),
-            ("renter_email", "ALTER TABLE rentals ADD COLUMN IF NOT EXISTS renter_email TEXT"),
-            ("days", "ALTER TABLE rentals ADD COLUMN IF NOT EXISTS days INTEGER DEFAULT 1"),
-            ("amount_total", "ALTER TABLE rentals ADD COLUMN IF NOT EXISTS amount_total INTEGER DEFAULT 0"),
-            ("currency", "ALTER TABLE rentals ADD COLUMN IF NOT EXISTS currency TEXT DEFAULT 'gbp'"),
-            ("checkout_session_id", "ALTER TABLE rentals ADD COLUMN IF NOT EXISTS checkout_session_id TEXT"),
-            ("payment_intent_id", "ALTER TABLE rentals ADD COLUMN IF NOT EXISTS payment_intent_id TEXT"),
-            ("status", "ALTER TABLE rentals ADD COLUMN IF NOT EXISTS status TEXT DEFAULT 'pending'"),
-            ("start_date", "ALTER TABLE rentals ADD COLUMN IF NOT EXISTS start_date DATE"),
-            ("end_date", "ALTER TABLE rentals ADD COLUMN IF NOT EXISTS end_date DATE"),
-            ("approved_by_lister", "ALTER TABLE rentals ADD COLUMN IF NOT EXISTS approved_by_lister BOOLEAN DEFAULT FALSE"),
-            ("declined_by_lister", "ALTER TABLE rentals ADD COLUMN IF NOT EXISTS declined_by_lister BOOLEAN DEFAULT FALSE"),
-        ]:
-            try:
-                cur.execute(ddl)
-            except Exception:
-                pass
+        cur.execute("ALTER TABLE rentals ADD COLUMN IF NOT EXISTS renter_id UUID;")
+        cur.execute("ALTER TABLE rentals ADD COLUMN IF NOT EXISTS renter_email TEXT;")
+        cur.execute("ALTER TABLE rentals ADD COLUMN IF NOT EXISTS days INTEGER DEFAULT 1;")
+        cur.execute("ALTER TABLE rentals ADD COLUMN IF NOT EXISTS amount_total INTEGER DEFAULT 0;")
+        cur.execute("ALTER TABLE rentals ADD COLUMN IF NOT EXISTS currency TEXT DEFAULT 'gbp';")
+        cur.execute("ALTER TABLE rentals ADD COLUMN IF NOT EXISTS checkout_session_id TEXT;")
+        cur.execute("ALTER TABLE rentals ADD COLUMN IF NOT EXISTS payment_intent_id TEXT;")
+        cur.execute("ALTER TABLE rentals ADD COLUMN IF NOT EXISTS status TEXT DEFAULT 'pending';")
+        cur.execute("ALTER TABLE rentals ADD COLUMN IF NOT EXISTS start_date DATE;")
+        cur.execute("ALTER TABLE rentals ADD COLUMN IF NOT EXISTS end_date DATE;");
+        cur.execute("ALTER TABLE rentals ADD COLUMN IF NOT EXISTS approved_by_lister BOOLEAN DEFAULT FALSE;")
+        cur.execute("ALTER TABLE rentals ADD COLUMN IF NOT EXISTS declined_by_lister BOOLEAN DEFAULT FALSE;")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_rentals_listing ON rentals(listing_id);")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_rentals_status ON rentals(status);")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_rentals_session ON rentals(checkout_session_id);")
@@ -157,14 +150,17 @@ def migrate():
         CREATE TABLE IF NOT EXISTS message_threads (
             id UUID PRIMARY KEY,
             rental_id UUID NOT NULL,
-            renter_id UUID NOT NULL,
-            lister_id UUID NOT NULL,
+            renter_id UUID,
+            lister_id UUID,
             is_unlocked BOOLEAN NOT NULL DEFAULT FALSE,
             created_at TIMESTAMP NOT NULL DEFAULT NOW()
         );
         """)
+        cur.execute("ALTER TABLE message_threads ADD COLUMN IF NOT EXISTS renter_id UUID;")
+        cur.execute("ALTER TABLE message_threads ADD COLUMN IF NOT EXISTS lister_id UUID;")
         cur.execute("ALTER TABLE message_threads ADD COLUMN IF NOT EXISTS is_unlocked BOOLEAN NOT NULL DEFAULT FALSE;")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_threads_rental ON message_threads(rental_id);")
+        # This index needs renter_id/lister_id to exist first
         cur.execute("CREATE INDEX IF NOT EXISTS idx_threads_parties ON message_threads(renter_id, lister_id);")
 
         # messages
@@ -239,6 +235,14 @@ def mask_email(e: str) -> str:
         return f"{name[0]}******@{dom}"
     except Exception:
         return e
+
+def get_user_id_by_email(email: Optional[str]) -> Optional[str]:
+    if not email:
+        return None
+    with db_conn() as conn, conn.cursor() as cur:
+        cur.execute("SELECT id FROM users WHERE lower(email)=lower(%s)", (email,))
+        row = cur.fetchone()
+        return str(row["id"]) if row else None
 
 def listing_public_shape(row: Dict[str, Any]) -> Dict[str, Any]:
     return {
@@ -547,6 +551,11 @@ def request_to_rent(body: RentRequestIn, current_user: Dict[str, Any] = Depends(
     if not lister_email:
         raise HTTPException(status_code=400, detail="Listing has no owner email on record")
 
+    # Try resolving lister_id if missing
+    lister_id = listing.get("owner_id")
+    if not lister_id:
+        lister_id = get_user_id_by_email(lister_email)
+
     dates_list = body.dates or []
     start_d = min(dates_list) if dates_list else None
     end_d   = max(dates_list) if dates_list else None
@@ -599,12 +608,12 @@ def request_to_rent(body: RentRequestIn, current_user: Dict[str, Any] = Depends(
             cur.execute("""
                 INSERT INTO message_threads (id, rental_id, renter_id, lister_id)
                 VALUES (%s, %s, %s, %s)
-            """, (thread_id, rental_id, current_user["id"], listing["owner_id"]))
+            """, (thread_id, rental_id, current_user["id"], lister_id))
             msg = "Renter requested dates: " + (", ".join(dates_list) if dates_list else "(none specified)")
             cur.execute("""
                 INSERT INTO messages (id, thread_id, sender_id, body, is_system)
                 VALUES (%s, %s, %s, %s, TRUE)
-            """, (str(uuid.uuid4()), thread_id, listing["owner_id"], msg))
+            """, (str(uuid.uuid4()), thread_id, lister_id or current_user["id"], msg))
         conn.commit()
 
     # Email: masked renter + approve link with rental_id
@@ -657,7 +666,7 @@ def request_to_rent(body: RentRequestIn, current_user: Dict[str, Any] = Depends(
             email_sent = (resp.status_code == 202)
         except Exception as e:
             logging.exception("SendGrid send failed: %s", e)
-            # Do not fail the request; the dashboard still has the thread & rental
+            # Do not fail the request; dashboard still has the thread & rental
     else:
         logging.warning("SENDGRID_API_KEY not set; skipping email send")
 
@@ -666,13 +675,10 @@ def request_to_rent(body: RentRequestIn, current_user: Dict[str, Any] = Depends(
 # -----------------------------
 # Threads & Messages
 # -----------------------------
-def can_reply(thread_row: Dict[str, Any]) -> bool:
-    return bool(thread_row.get("is_unlocked"))
-
 @app.get("/message-threads")
 def message_threads(current_user: Dict[str, Any] = Depends(get_current_user)):
     """
-    Returns threads visible to the user with minimal info for dashboard.
+    Threads visible to user (masked counterpart; replies unlocked on payment).
     """
     with db_conn() as conn, conn.cursor() as cur:
         cur.execute("""
@@ -690,7 +696,7 @@ def message_threads(current_user: Dict[str, Any] = Depends(get_current_user)):
 
     out = []
     for row in rows:
-        if str(current_user["id"]) == str(row["renter_id"]):
+        if str(current_user["id"]) == str(row.get("renter_id")):
             counterpart = mask_email(row.get("owner_email") or "")
             role = "renter"
         else:
@@ -728,7 +734,7 @@ def get_thread(thread_id: uuid.UUID, current_user: Dict[str, Any] = Depends(get_
         t = cur.fetchone()
         if not t:
             raise HTTPException(status_code=404, detail="Thread not found")
-        if str(current_user["id"]) not in {str(t["renter_id"]), str(t["lister_id"])}:
+        if str(current_user["id"]) not in {str(t.get("renter_id")), str(t.get("lister_id"))}:
             raise HTTPException(status_code=403, detail="Not allowed")
 
         cur.execute("""
@@ -754,7 +760,6 @@ def get_thread(thread_id: uuid.UUID, current_user: Dict[str, Any] = Depends(get_
 
 @app.get("/messages")
 def messages_alias(thread_id: uuid.UUID = Query(...), current_user: Dict[str, Any] = Depends(get_current_user)):
-    # Simple alias to get_thread for convenience
     return get_thread(thread_id, current_user)
 
 @app.post("/threads/{thread_id}/message")
@@ -771,7 +776,7 @@ def send_message(thread_id: uuid.UUID, body: SendMessageIn, current_user: Dict[s
         t = cur.fetchone()
         if not t:
             raise HTTPException(status_code=404, detail="Thread not found")
-        if str(current_user["id"]) not in {str(t["renter_id"]), str(t["lister_id"])}:
+        if str(current_user["id"]) not in {str(t.get("renter_id")), str(t.get("lister_id"))}:
             raise HTTPException(status_code=403, detail="Not allowed")
         if not bool(t["is_unlocked"]):
             raise HTTPException(status_code=403, detail="Chat locked until payment")
@@ -800,7 +805,7 @@ def send_message(thread_id: uuid.UUID, body: SendMessageIn, current_user: Dict[s
 def _assert_lister_for_rental(rental_id: str, user_id: str):
     with db_conn() as conn, conn.cursor() as cur:
         cur.execute("""
-            SELECT r.id, l.owner_id
+            SELECT r.id, l.owner_id, l.owner_email
             FROM rentals r
             JOIN listings l ON l.id = r.listing_id
             WHERE r.id=%s
@@ -808,7 +813,8 @@ def _assert_lister_for_rental(rental_id: str, user_id: str):
         row = cur.fetchone()
         if not row:
             raise HTTPException(status_code=404, detail="Rental not found")
-        if str(row["owner_id"]) != str(user_id):
+        owner_id = row.get("owner_id") or get_user_id_by_email(row.get("owner_email"))
+        if str(owner_id) != str(user_id):
             raise HTTPException(status_code=403, detail="Only the lister can perform this action")
 
 @app.post("/rentals/{rental_id}/approve")
@@ -892,7 +898,7 @@ def create_checkout_session(body: CheckoutIn, current_user: Dict[str, Any] = Dep
 
     with db_conn() as conn, conn.cursor() as cur:
         cur.execute("""
-            SELECT l.id, l.name, l.location, l.price_per_day, l.owner_id, u.stripe_account_id
+            SELECT l.id, l.name, l.location, l.price_per_day, l.owner_id, l.owner_email, u.stripe_account_id
             FROM listings l
             LEFT JOIN users u ON u.id = l.owner_id
             WHERE l.id=%s
@@ -900,6 +906,7 @@ def create_checkout_session(body: CheckoutIn, current_user: Dict[str, Any] = Dep
         listing = cur.fetchone()
         if not listing:
             raise HTTPException(status_code=404, detail="Listing not found")
+
         lister_acct = listing.get("stripe_account_id")
         if not lister_acct:
             raise HTTPException(status_code=400, detail="Lister has not completed Stripe onboarding")
@@ -927,7 +934,7 @@ def create_checkout_session(body: CheckoutIn, current_user: Dict[str, Any] = Dep
                             "name": f"{listing['name']} — {listing['location']}",
                             "metadata": {
                                 "listing_id": str(listing["id"]),
-                                "owner_id": str(listing["owner_id"]),
+                                "owner_id": str(listing.get("owner_id") or get_user_id_by_email(listing.get("owner_email")) or "")
                             }
                         },
                         "unit_amount": unit_amount,
@@ -1027,7 +1034,6 @@ async def stripe_webhook(request: Request):
                 """, (payment_intent_id, start_d, end_d, session_id))
                 r = cur.fetchone()
                 if not r:
-                    # graceful no-op
                     conn.commit()
                     return PlainTextResponse("ok", status_code=200)
 
@@ -1035,16 +1041,15 @@ async def stripe_webhook(request: Request):
                 listing_id = r["listing_id"]
                 renter_id = r["renter_id"]
 
-                # Unlock thread
+                # Unlock thread; create one if missing
                 cur.execute("SELECT id FROM message_threads WHERE rental_id=%s", (rental_id,))
                 t = cur.fetchone()
                 if t:
                     cur.execute("UPDATE message_threads SET is_unlocked=TRUE WHERE id=%s", (t["id"],))
                 else:
-                    # create thread if somehow missing
-                    cur.execute("SELECT owner_id FROM listings WHERE id=%s", (listing_id,))
+                    cur.execute("SELECT owner_id, owner_email FROM listings WHERE id=%s", (listing_id,))
                     row = cur.fetchone()
-                    lister_id = row["owner_id"] if row else None
+                    lister_id = row.get("owner_id") or get_user_id_by_email(row.get("owner_email"))
                     thread_id = str(uuid.uuid4())
                     cur.execute("""
                         INSERT INTO message_threads (id, rental_id, renter_id, lister_id, is_unlocked)
@@ -1053,8 +1058,7 @@ async def stripe_webhook(request: Request):
                     cur.execute("""
                         INSERT INTO messages (id, thread_id, sender_id, body, is_system)
                         VALUES (%s, %s, %s, %s, TRUE)
-                    """, (str(uuid.uuid4()), thread_id, lister_id, "✅ Payment confirmed. You can chat here to arrange pickup and return."))
-
+                    """, (str(uuid.uuid4()), thread_id, lister_id or renter_id, "✅ Payment confirmed. You can chat here to arrange pickup and return."))
                 conn.commit()
 
         elif type_ in ("checkout.session.expired", "payment_intent.payment_failed"):
@@ -1072,6 +1076,8 @@ async def stripe_webhook(request: Request):
         return JSONResponse(status_code=500, content={"error": "Webhook handler error"})
 
     return PlainTextResponse("ok", status_code=200)
+
+
 
 
 
