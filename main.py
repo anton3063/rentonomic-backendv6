@@ -1,3 +1,7 @@
+# main.py — Rentonomic API (v14.3)
+# - Accepts BOTH legacy tokens (sub=email) and modern tokens (uid=UUID)
+# - Uses get_user_uuid() everywhere a UUID is needed
+# - Keeps the request-to-rent + email actions + threads + Stripe + permissive CORS
 
 import os
 import uuid
@@ -14,10 +18,7 @@ import psycopg2.extras
 # === UUID adapter fix (prevents "can't adapt type 'UUID'") ===
 from psycopg2.extensions import register_adapter, AsIs
 import uuid as _uuid
-
-def _adapt_uuid(u: _uuid.UUID):
-    return AsIs(f"'{u}'::uuid")
-
+def _adapt_uuid(u: _uuid.UUID): return AsIs(f"'{u}'::uuid")
 register_adapter(_uuid.UUID, _adapt_uuid)
 
 from fastapi import FastAPI, Depends, HTTPException, UploadFile, File, Form, Request, Query
@@ -295,8 +296,7 @@ migrate()
 # Helpers
 # -----------------------------
 def mask_email(e: Optional[str]) -> str:
-    if not e:
-        return ""
+    if not e: return ""
     try:
         u, d = e.split("@", 1)
         if len(u) <= 2:
@@ -596,8 +596,7 @@ def post_message(thread_id: uuid.UUID, data: MessageIn, user=Depends(get_current
             INSERT INTO messages(thread_id, sender_id, body)
             VALUES (%s, %s, %s) RETURNING id, created_at
         """, (thread_id, uid, data.body))
-        row = cur.fetchone()
-        mid, created_at = row[0], row[1]
+        mid, created_at = cur.fetchone()
         conn.commit()
         return {"id": str(mid), "created_at": created_at.isoformat()}
 
@@ -681,7 +680,10 @@ def request_to_rent(data: RentRequestIn, user=Depends(get_current_user)):
     thread_id = create_or_get_thread_for_listing(data.listing_id, user, start_date, end_date)
 
     # email to lister with Approve/Decline actions
-    send_rent_request_email_with_actions(listing_name, lister_email, user.get("email"), thread_id, start_date, end_date)
+    try:
+        send_rent_request_email_with_actions(listing_name, lister_email, user.get("email"), thread_id, start_date, end_date)
+    except Exception as e:
+        logging.error("send_rent_request_email_with_actions: failed to send email, continuing without blocking user flow: %s", e, exc_info=True)
 
     # system message in thread
     with get_conn() as conn, conn.cursor() as cur:
@@ -892,6 +894,9 @@ def root():
 @app.get("/healthz")
 def healthz():
     return PlainTextResponse("ok")
+
+
+
 
 
 
