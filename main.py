@@ -659,7 +659,12 @@ def send_rent_request_email_with_actions(listing_name: str, lister_email: str, r
         <p style="color:#555;font-size:12px">For privacy, renter emails are masked. Chat happens inside your Rentonomic dashboard.</p>
       </div>
     """
-    send_email_html(lister_email, f"Rental enquiry — {listing_name}", html)
+    # Try to send the email, but do NOT let email failures crash the API flow.
+    try:
+        send_email_html(lister_email, f"Rental enquiry — {listing_name}", html)
+    except Exception as e:
+        # Log full exception, but continue — this prevents a 500 when SendGrid is misconfigured.
+        logging.exception("send_rent_request_email_with_actions: failed to send email, continuing without blocking user flow: %s", e)
 
 @app.post("/request-to-rent")
 def request_to_rent(data: RentRequestIn, user=Depends(get_current_user)):
@@ -891,6 +896,8 @@ def root():
 @app.get("/healthz")
 def healthz():
     return PlainTextResponse("ok")
+
+
 
 
 
