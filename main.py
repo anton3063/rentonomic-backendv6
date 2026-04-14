@@ -18,12 +18,13 @@ import psycopg2.extras
 # === UUID adapter fix (prevents "can't adapt type 'UUID'") ===
 from psycopg2.extensions import register_adapter, AsIs
 import uuid as _uuid
-def _adapt_uuid(u: _uuid.UUID): return AsIs(f"'{u}'::uuid")
+def _adapt_uuid(u: _uuid.UUID):
+    return AsIs(f"'{u}'::uuid")
 register_adapter(_uuid.UUID, _adapt_uuid)
 
-from fastapi import FastAPI, Depends, HTTPException, UploadFile, File, Form, Request, Query
+from fastapi import FastAPI, Depends, HTTPException, UploadFile, File, Form, Request, Query, Response
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse, PlainTextResponse, HTMLResponse
+from fastapi.responses import PlainTextResponse, HTMLResponse
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from pydantic import BaseModel, EmailStr
 
@@ -158,8 +159,8 @@ def jwt_decode(token: str, secret: str) -> dict:
 def make_token(user_id: str, email: str, is_admin: bool = False) -> str:
     exp = int((datetime.utcnow() + timedelta(minutes=JWT_EXP_MIN)).timestamp())
     payload = {
-        "sub": email,                  # legacy compat (sub=email)
-        "uid": user_id,                # canonical user UUID
+        "sub": email,
+        "uid": user_id,
         "email": email,
         "is_admin": is_admin,
         "exp": exp,
@@ -175,29 +176,28 @@ def admin_guard(user: dict):
     if not user.get("is_admin"):
         raise HTTPException(403, "Admin only")
 
-# === Canonical user UUID extractor (accepts old & new tokens) ===
+# -----------------------------
+# Canonical user UUID extractor
+# -----------------------------
 def get_user_uuid(claims: dict) -> uuid.UUID:
-    """
-    Accept tokens where:
-      - uid is the UUID (preferred)
-      - sub is the UUID (older)
-      - sub is email (legacy); fallback to DB lookup
-    """
     v = claims.get("uid")
     if v:
         try:
             return uuid.UUID(v)
         except Exception:
             pass
+
     v = claims.get("sub")
     if v:
         try:
             return uuid.UUID(v)
         except Exception:
             pass
+
     email = (claims.get("email") or "").strip().lower()
     if not email:
         raise HTTPException(401, "Invalid token payload")
+
     with get_conn() as conn, conn.cursor() as cur:
         cur.execute("SELECT id FROM users WHERE lower(email)=lower(%s)", (email,))
         row = cur.fetchone()
@@ -206,7 +206,7 @@ def get_user_uuid(claims: dict) -> uuid.UUID:
         return row[0]
 
 # -----------------------------
-# One-click action signing (Approve/Decline)
+# One-click action signing
 # -----------------------------
 def make_action_token(action: str, thread_id: uuid.UUID, ttl_minutes: int = 7 * 24 * 60) -> str:
     exp = int((datetime.utcnow() + timedelta(minutes=ttl_minutes)).timestamp())
@@ -233,6 +233,7 @@ def migrate():
     with get_conn() as conn:
         with conn.cursor() as cur:
             cur.execute("CREATE EXTENSION IF NOT EXISTS pgcrypto;")
+
             cur.execute("""
             CREATE TABLE IF NOT EXISTS users (
                 id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -240,7 +241,9 @@ def migrate():
                 password_hash TEXT NOT NULL,
                 is_admin BOOLEAN NOT NULL DEFAULT FALSE,
                 created_at TIMESTAMPTZ NOT NULL DEFAULT now()
-            );""")
+            );
+            """)
+
             cur.execute("""
             CREATE TABLE IF NOT EXISTS listings (
                 id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -252,7 +255,9 @@ def migrate():
                 price_per_day NUMERIC NOT NULL DEFAULT 0,
                 image_url TEXT,
                 created_at TIMESTAMPTZ NOT NULL DEFAULT now()
-            );""")
+            );
+            """)
+
             cur.execute("""
             CREATE TABLE IF NOT EXISTS rentals (
                 id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -267,7 +272,9 @@ def migrate():
                 end_date DATE,
                 status TEXT NOT NULL DEFAULT 'pending',
                 created_at TIMESTAMPTZ NOT NULL DEFAULT now()
-            );""")
+            );
+            """)
+
             cur.execute("""
             CREATE TABLE IF NOT EXISTS message_threads (
                 thread_id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -282,7 +289,9 @@ def migrate():
                 is_unlocked BOOLEAN NOT NULL DEFAULT FALSE,
                 status TEXT NOT NULL DEFAULT 'pending',
                 created_at TIMESTAMPTZ NOT NULL DEFAULT now()
-            );""")
+            );
+            """)
+
             cur.execute("""
             CREATE TABLE IF NOT EXISTS messages (
                 id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -290,12 +299,15 @@ def migrate():
                 sender_id UUID REFERENCES users(id),
                 body TEXT NOT NULL,
                 created_at TIMESTAMPTZ NOT NULL DEFAULT now()
-            );""")
+            );
+            """)
+
             cur.execute("CREATE INDEX IF NOT EXISTS idx_listings_owner ON listings(owner_id);")
             cur.execute("CREATE INDEX IF NOT EXISTS idx_rentals_listing ON rentals(listing_id);")
             cur.execute("CREATE INDEX IF NOT EXISTS idx_threads_listing ON message_threads(listing_id);")
             cur.execute("CREATE INDEX IF NOT EXISTS idx_threads_parties ON message_threads(renter_id, lister_id);")
             cur.execute("CREATE INDEX IF NOT EXISTS idx_messages_thread ON messages(thread_id);")
+
         conn.commit()
 
 migrate()
@@ -322,12 +334,14 @@ def send_email_html(to_addr: str, subject: str, html: str):
     if not SENDGRID_API_KEY:
         logging.error("SENDGRID_API_KEY not set")
         raise HTTPException(500, "Email not configured")
+
     mail = Mail(
         from_email=Email(SENDGRID_FROM, "Rentonomic Alerts"),
         to_emails=[To(to_addr)],
         subject=subject,
         html_content=Content("text/html", html),
     )
+
     try:
         resp = sg_client().send(mail)
         if resp.status_code not in (200, 202):
@@ -353,6 +367,7 @@ def _extract_email_password_mode(request: Request) -> str:
 @app.post("/signup")
 async def signup(request: Request):
     mode = _extract_email_password_mode(request)
+
     if mode == "json":
         data = await request.json()
         email = str(data.get("email", "")).lower().strip()
@@ -368,18 +383,25 @@ async def signup(request: Request):
         raise HTTPException(400, "Password too short")
 
     pw_hash = hashlib.sha256(password.encode()).hexdigest()
+
     with get_conn() as conn, conn.cursor(cursor_factory=psycopg2.extras.DictCursor) as cur:
         cur.execute("SELECT id FROM users WHERE lower(email)=lower(%s)", (email,))
         if cur.fetchone():
             raise HTTPException(400, "Email already registered")
-        cur.execute("INSERT INTO users(email, password_hash) VALUES (%s,%s) RETURNING id, is_admin", (email, pw_hash))
+
+        cur.execute(
+            "INSERT INTO users(email, password_hash) VALUES (%s,%s) RETURNING id, is_admin",
+            (email, pw_hash)
+        )
         row = cur.fetchone()
         token = make_token(str(row["id"]), email, is_admin=row["is_admin"])
+
     return {"token": token}
 
 @app.post("/login")
 async def login(request: Request):
     mode = _extract_email_password_mode(request)
+
     if mode == "json":
         data = await request.json()
         email = str(data.get("email", "")).lower().strip()
@@ -393,12 +415,16 @@ async def login(request: Request):
         raise HTTPException(400, "Email and password required")
 
     pw_hash = hashlib.sha256(password.encode()).hexdigest()
+
     with get_conn() as conn, conn.cursor(cursor_factory=psycopg2.extras.DictCursor) as cur:
         cur.execute("SELECT id, is_admin, password_hash FROM users WHERE lower(email)=lower(%s)", (email,))
         row = cur.fetchone()
+
         if not row or row["password_hash"] != pw_hash:
             raise HTTPException(401, "Invalid email or password")
+
         token = make_token(str(row["id"]), email, is_admin=row["is_admin"])
+
     return {"token": token}
 
 @app.get("/me")
@@ -420,6 +446,7 @@ def get_listings():
             LIMIT 100
         """)
         rows = cur.fetchall()
+
         return [
             {
                 "id": str(r["id"]),
@@ -440,6 +467,7 @@ def get_listings():
 def my_listings(user=Depends(get_current_user)):
     uid = get_user_uuid(user)
     email = user.get("email", "").lower()
+
     with get_conn() as conn, conn.cursor(cursor_factory=psycopg2.extras.DictCursor) as cur:
         cur.execute("""
             SELECT id, owner_id, owner_email, name, location, description, price_per_day, image_url, created_at
@@ -448,6 +476,7 @@ def my_listings(user=Depends(get_current_user)):
             ORDER BY created_at DESC
         """, (uid, email))
         rows = cur.fetchall()
+
         return [
             {
                 "id": str(r["id"]),
@@ -463,6 +492,18 @@ def my_listings(user=Depends(get_current_user)):
             for r in rows
         ]
 
+@app.options("/listings")
+def options_listings():
+    return Response(
+        status_code=204,
+        headers={
+            "Access-Control-Allow-Origin": "https://rentonomic.com",
+            "Access-Control-Allow-Methods": "POST, OPTIONS",
+            "Access-Control-Allow-Headers": "authorization, content-type",
+            "Access-Control-Max-Age": "86400",
+        },
+    )
+
 @app.post("/listings")
 def create_listing(
     name: str = Form(...),
@@ -475,9 +516,11 @@ def create_listing(
     owner_id = get_user_uuid(user)
     owner_email = user.get("email")
     image_url = None
+
     if image and CLOUDINARY_URL:
         up = cloudinary.uploader.upload(image.file, folder="rentonomic/listings")
         image_url = up.get("secure_url")
+
     with get_conn() as conn, conn.cursor() as cur:
         cur.execute("""
             INSERT INTO listings (owner_id, owner_email, name, location, description, price_per_day, image_url)
@@ -486,6 +529,7 @@ def create_listing(
         """, (owner_id, owner_email, name, location, description, price_per_day, image_url))
         lid = cur.fetchone()[0]
         conn.commit()
+
     return {"id": str(lid)}
 
 @app.put("/listings/{listing_id}")
@@ -503,6 +547,7 @@ def update_listing(
             up = cloudinary.uploader.upload(image.file, folder="rentonomic/listings")
             image_url = up.get("secure_url")
             cur.execute("UPDATE listings SET image_url=%s WHERE id=%s", (image_url, listing_id))
+
         if name is not None:
             cur.execute("UPDATE listings SET name=%s WHERE id=%s", (name, listing_id))
         if location is not None:
@@ -511,7 +556,9 @@ def update_listing(
             cur.execute("UPDATE listings SET description=%s WHERE id=%s", (description, listing_id))
         if price_per_day is not None:
             cur.execute("UPDATE listings SET price_per_day=%s WHERE id=%s", (price_per_day, listing_id))
+
         conn.commit()
+
     return {"ok": True}
 
 @app.delete("/listings/{listing_id}")
@@ -527,6 +574,7 @@ def delete_listing(listing_id: uuid.UUID, user=Depends(get_current_user)):
 @app.get("/message-threads")
 def list_threads(user=Depends(get_current_user)):
     uid = get_user_uuid(user)
+
     with get_conn() as conn, conn.cursor(cursor_factory=psycopg2.extras.DictCursor) as cur:
         cur.execute("""
             SELECT t.thread_id, t.listing_id, t.rental_id, t.lister_id, t.renter_id,
@@ -539,13 +587,18 @@ def list_threads(user=Depends(get_current_user)):
             ORDER BY t.created_at DESC
         """, (uid, uid))
         rows = cur.fetchall()
+
         out = []
         for r in rows:
             you_are_lister = str(r["lister_id"]) == str(uid)
             counter = r["renter_email"] if you_are_lister else r["lister_email"]
             out.append({
                 "thread_id": str(r["thread_id"]),
-                "listing": {"id": str(r["listing_id"]), "name": r["listing_name"], "location": r["listing_location"]},
+                "listing": {
+                    "id": str(r["listing_id"]),
+                    "name": r["listing_name"],
+                    "location": r["listing_location"]
+                },
                 "rental_id": str(r["rental_id"]) if r["rental_id"] else None,
                 "is_unlocked": bool(r["is_unlocked"]),
                 "status": r["status"],
@@ -553,11 +606,13 @@ def list_threads(user=Depends(get_current_user)):
                 "end_date": r["end_date"].isoformat() if r["end_date"] else None,
                 "counterparty": mask_email(counter),
             })
+
         return out
 
 @app.get("/threads/{thread_id}")
 def get_thread(thread_id: uuid.UUID, user=Depends(get_current_user)):
     uid = get_user_uuid(user)
+
     with get_conn() as conn, conn.cursor(cursor_factory=psycopg2.extras.DictCursor) as cur:
         cur.execute("""
             SELECT t.thread_id, t.lister_id, t.renter_id, t.is_unlocked, t.status
@@ -565,8 +620,10 @@ def get_thread(thread_id: uuid.UUID, user=Depends(get_current_user)):
             WHERE t.thread_id = %s AND (t.lister_id = %s OR t.renter_id = %s)
         """, (thread_id, uid, uid))
         th = cur.fetchone()
+
         if not th:
             raise HTTPException(404, "Thread not found")
+
         cur.execute("""
             SELECT id, sender_id, body, created_at
             FROM messages
@@ -574,6 +631,7 @@ def get_thread(thread_id: uuid.UUID, user=Depends(get_current_user)):
             ORDER BY created_at ASC
         """, (thread_id,))
         msgs = cur.fetchall()
+
         return {
             "thread_id": str(th["thread_id"]),
             "is_unlocked": bool(th["is_unlocked"]),
@@ -591,34 +649,46 @@ def get_thread(thread_id: uuid.UUID, user=Depends(get_current_user)):
 @app.post("/threads/{thread_id}/message")
 def post_message(thread_id: uuid.UUID, data: MessageIn, user=Depends(get_current_user)):
     uid = get_user_uuid(user)
+
     with get_conn() as conn, conn.cursor(cursor_factory=psycopg2.extras.DictCursor) as cur:
         cur.execute("""
             SELECT is_unlocked FROM message_threads
             WHERE thread_id = %s AND (lister_id = %s OR renter_id = %s)
         """, (thread_id, uid, uid))
         th = cur.fetchone()
+
         if not th:
             raise HTTPException(404, "Thread not found")
         if not th["is_unlocked"]:
             raise HTTPException(403, "Thread locked until payment completes")
+
         cur.execute("""
             INSERT INTO messages(thread_id, sender_id, body)
             VALUES (%s, %s, %s) RETURNING id, created_at
         """, (thread_id, uid, data.body))
         mid, created_at = cur.fetchone()
         conn.commit()
+
         return {"id": str(mid), "created_at": created_at.isoformat()}
 
 # -----------------------------
-# Request to Rent (+ email with Approve/Decline links)
+# Request to Rent
 # -----------------------------
-def create_or_get_thread_for_listing(listing_id: uuid.UUID, current_user: dict, start_date: Optional[str], end_date: Optional[str]) -> uuid.UUID:
+def create_or_get_thread_for_listing(
+    listing_id: uuid.UUID,
+    current_user: dict,
+    start_date: Optional[str],
+    end_date: Optional[str]
+) -> uuid.UUID:
     uid = get_user_uuid(current_user)
+
     with get_conn() as conn, conn.cursor(cursor_factory=psycopg2.extras.DictCursor) as cur:
         cur.execute("SELECT id, owner_id, owner_email, name FROM listings WHERE id=%s", (listing_id,))
         lst = cur.fetchone()
+
         if not lst:
             raise HTTPException(404, "Listing not found")
+
         lister_id = lst["owner_id"]
         lister_email = lst["owner_email"]
 
@@ -628,6 +698,7 @@ def create_or_get_thread_for_listing(listing_id: uuid.UUID, current_user: dict, 
             ORDER BY created_at DESC LIMIT 1
         """, (listing_id, lister_id, uid))
         th = cur.fetchone()
+
         if th:
             thread_id = th["thread_id"]
             if start_date and end_date:
@@ -639,7 +710,10 @@ def create_or_get_thread_for_listing(listing_id: uuid.UUID, current_user: dict, 
             return thread_id
 
         cur.execute("""
-            INSERT INTO message_threads(listing_id, lister_id, renter_id, lister_email, renter_email, start_date, end_date, status, is_unlocked)
+            INSERT INTO message_threads(
+                listing_id, lister_id, renter_id, lister_email, renter_email,
+                start_date, end_date, status, is_unlocked
+            )
             VALUES (%s,%s,%s,%s,%s,%s,%s,'pending',FALSE)
             RETURNING thread_id
         """, (listing_id, lister_id, uid, lister_email, current_user.get("email"), start_date, end_date))
@@ -682,14 +756,17 @@ def request_to_rent(data: RentRequestIn, user=Depends(get_current_user)):
     dates = data.dates or []
     if not dates:
         raise HTTPException(422, "Dates array required")
+
     start_date = min(dates)
     end_date = max(dates)
 
     with get_conn() as conn, conn.cursor(cursor_factory=psycopg2.extras.DictCursor) as cur:
         cur.execute("SELECT id, name, owner_email FROM listings WHERE id=%s", (data.listing_id,))
         lst = cur.fetchone()
+
         if not lst:
             raise HTTPException(404, "Listing not found")
+
         listing_name = lst["name"]
         lister_email = lst["owner_email"]
 
@@ -706,7 +783,7 @@ def request_to_rent(data: RentRequestIn, user=Depends(get_current_user)):
         )
     except Exception as e:
         logging.error(
-            "send_rent_request_email_with_actions: failed to send email, continuing without blocking user flow: %s",
+            "send_rent_request_email_with_actions failed, continuing: %s",
             e,
             exc_info=True
         )
@@ -721,7 +798,7 @@ def request_to_rent(data: RentRequestIn, user=Depends(get_current_user)):
     return {"ok": True, "thread_id": str(thread_id)}
 
 # -----------------------------
-# One-click Approve / Decline endpoints
+# One-click Approve / Decline
 # -----------------------------
 def _action_result_page(title: str, message: str, redirect_url: str) -> str:
     return f"""<!doctype html>
@@ -755,6 +832,7 @@ def action_approve(tid: uuid.UUID = Query(...), token: str = Query(...)):
             ),
             status_code=400
         )
+
     with get_conn() as conn, conn.cursor() as cur:
         cur.execute("SELECT thread_id FROM message_threads WHERE thread_id=%s", (tid,))
         if not cur.fetchone():
@@ -766,8 +844,10 @@ def action_approve(tid: uuid.UUID = Query(...), token: str = Query(...)):
                 ),
                 status_code=404
             )
+
         cur.execute("UPDATE message_threads SET status='approved' WHERE thread_id=%s", (tid,))
         conn.commit()
+
     return HTMLResponse(_action_result_page("Approved", "You approved this rental request.", f"{FRONTEND_URL}/dashboard.html"))
 
 @app.get("/action/decline")
@@ -781,6 +861,7 @@ def action_decline(tid: uuid.UUID = Query(...), token: str = Query(...)):
             ),
             status_code=400
         )
+
     with get_conn() as conn, conn.cursor() as cur:
         cur.execute("SELECT thread_id FROM message_threads WHERE thread_id=%s", (tid,))
         if not cur.fetchone():
@@ -792,8 +873,10 @@ def action_decline(tid: uuid.UUID = Query(...), token: str = Query(...)):
                 ),
                 status_code=404
             )
+
         cur.execute("UPDATE message_threads SET status='declined' WHERE thread_id=%s", (tid,))
         conn.commit()
+
     return HTMLResponse(_action_result_page("Declined", "You declined this rental request.", f"{FRONTEND_URL}/dashboard.html"))
 
 # -----------------------------
@@ -869,8 +952,10 @@ async def stripe_webhook(request: Request):
     if not STRIPE_WEBHOOK_SECRET:
         logging.error("STRIPE_WEBHOOK_SECRET not set")
         raise HTTPException(500, "Webhook not configured")
+
     payload = await request.body()
     sig = request.headers.get("stripe-signature")
+
     try:
         event = stripe.Webhook.construct_event(payload, sig, STRIPE_WEBHOOK_SECRET)
     except Exception as e:
@@ -885,6 +970,7 @@ async def stripe_webhook(request: Request):
         md = data.get("metadata") or {}
         rental_id = md.get("rental_id")
         thread_id = md.get("thread_id")
+
         with get_conn() as conn, conn.cursor() as cur:
             if rental_id:
                 try:
@@ -893,7 +979,10 @@ async def stripe_webhook(request: Request):
                     pass
             if thread_id:
                 try:
-                    cur.execute("UPDATE message_threads SET is_unlocked=TRUE, status='paid' WHERE thread_id=%s", (uuid.UUID(thread_id),))
+                    cur.execute(
+                        "UPDATE message_threads SET is_unlocked=TRUE, status='paid' WHERE thread_id=%s",
+                        (uuid.UUID(thread_id),)
+                    )
                 except Exception:
                     pass
             conn.commit()
@@ -901,11 +990,12 @@ async def stripe_webhook(request: Request):
     return PlainTextResponse("ok")
 
 # -----------------------------
-# Approve / Decline via API (authenticated)
+# Approve / Decline via API
 # -----------------------------
 @app.post("/rentals/{rental_id}/approve")
 def approve_rental(rental_id: uuid.UUID, user=Depends(get_current_user)):
     uid = get_user_uuid(user)
+
     with get_conn() as conn, conn.cursor(cursor_factory=psycopg2.extras.DictCursor) as cur:
         cur.execute("""
             SELECT r.id, r.listing_id, l.owner_id, t.thread_id
@@ -915,19 +1005,23 @@ def approve_rental(rental_id: uuid.UUID, user=Depends(get_current_user)):
             WHERE r.id = %s
         """, (rental_id,))
         row = cur.fetchone()
+
         if not row:
             raise HTTPException(404, "Rental not found")
         if str(row["owner_id"]) != str(uid):
             raise HTTPException(403, "Only the lister can approve")
+
         cur.execute("UPDATE rentals SET status='approved' WHERE id=%s", (rental_id,))
         if row["thread_id"]:
             cur.execute("UPDATE message_threads SET status='approved' WHERE thread_id=%s", (row["thread_id"],))
         conn.commit()
+
     return {"ok": True}
 
 @app.post("/rentals/{rental_id}/decline")
 def decline_rental(rental_id: uuid.UUID, user=Depends(get_current_user)):
     uid = get_user_uuid(user)
+
     with get_conn() as conn, conn.cursor(cursor_factory=psycopg2.extras.DictCursor) as cur:
         cur.execute("""
             SELECT r.id, r.listing_id, l.owner_id, t.thread_id
@@ -937,14 +1031,17 @@ def decline_rental(rental_id: uuid.UUID, user=Depends(get_current_user)):
             WHERE r.id = %s
         """, (rental_id,))
         row = cur.fetchone()
+
         if not row:
             raise HTTPException(404, "Rental not found")
         if str(row["owner_id"]) != str(uid):
             raise HTTPException(403, "Only the lister can decline")
+
         cur.execute("UPDATE rentals SET status='declined' WHERE id=%s", (rental_id,))
         if row["thread_id"]:
             cur.execute("UPDATE message_threads SET status='declined' WHERE thread_id=%s", (row["thread_id"],))
         conn.commit()
+
     return {"ok": True}
 
 # -----------------------------
@@ -957,6 +1054,7 @@ def root():
 @app.get("/healthz")
 def healthz():
     return PlainTextResponse("ok")
+
 @app.get("/__debug")
 def debug():
     return {
