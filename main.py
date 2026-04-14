@@ -21,7 +21,7 @@ import uuid as _uuid
 def _adapt_uuid(u: _uuid.UUID): return AsIs(f"'{u}'::uuid")
 register_adapter(_uuid.UUID, _adapt_uuid)
 
-from fastapi import FastAPI, Depends, HTTPException, UploadFile, File, Form, Request, Query, Response
+from fastapi import FastAPI, Depends, HTTPException, UploadFile, File, Form, Request, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, PlainTextResponse, HTMLResponse
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
@@ -63,32 +63,27 @@ BACKEND_URL = os.getenv("BACKEND_URL", "https://rentonomic-backend.onrender.com"
 stripe.api_key = STRIPE_SECRET_KEY
 
 # -----------------------------
-# App + Permissive CORS (for now)
+# App + CORS
 # -----------------------------
 app = FastAPI(title="Rentonomic API", version="14.3")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=False,
+    allow_origins=[
+        "https://rentonomic.com",
+        "https://www.rentonomic.com",
+        "https://rentonomic.netlify.app",
+        "http://localhost:3000",
+        "http://127.0.0.1:3000",
+        "http://localhost:5500",
+        "http://127.0.0.1:5500",
+    ],
+    allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
     expose_headers=["*"],
     max_age=86400,
 )
-
-# Explicit preflight handler to stop browser OPTIONS 405 on authenticated cross-origin requests
-@app.options("/{rest_of_path:path}")
-def preflight_handler(rest_of_path: str):
-    return Response(
-        status_code=204,
-        headers={
-            "Access-Control-Allow-Origin": "*",
-            "Access-Control-Allow-Methods": "*",
-            "Access-Control-Allow-Headers": "*",
-            "Access-Control-Max-Age": "86400",
-        },
-    )
 
 security = HTTPBearer()
 logging.basicConfig(level=logging.INFO)
@@ -213,7 +208,7 @@ def get_user_uuid(claims: dict) -> uuid.UUID:
 # -----------------------------
 # One-click action signing (Approve/Decline)
 # -----------------------------
-def make_action_token(action: str, thread_id: uuid.UUID, ttl_minutes: int = 7*24*60) -> str:
+def make_action_token(action: str, thread_id: uuid.UUID, ttl_minutes: int = 7 * 24 * 60) -> str:
     exp = int((datetime.utcnow() + timedelta(minutes=ttl_minutes)).timestamp())
     raw = f"{action}|{thread_id}|{exp}".encode()
     sig = hmac.new(JWT_SECRET.encode(), raw, hashlib.sha256).digest()
@@ -309,13 +304,14 @@ migrate()
 # Helpers
 # -----------------------------
 def mask_email(e: Optional[str]) -> str:
-    if not e: return ""
+    if not e:
+        return ""
     try:
         u, d = e.split("@", 1)
         if len(u) <= 2:
             return u[:1] + "*" + "@" + d
-        return f"{u[0]}{'*'*(len(u)-2)}{u[-1]}@{d}"
-    except:
+        return f"{u[0]}{'*' * (len(u) - 2)}{u[-1]}@{d}"
+    except Exception:
         return e
 
 def sg_client(host: Optional[str] = None) -> SendGridAPIClient:
@@ -626,7 +622,6 @@ def create_or_get_thread_for_listing(listing_id: uuid.UUID, current_user: dict, 
         lister_id = lst["owner_id"]
         lister_email = lst["owner_email"]
 
-        # existing thread?
         cur.execute("""
             SELECT thread_id FROM message_threads
             WHERE listing_id=%s AND lister_id=%s AND renter_id=%s
@@ -636,12 +631,13 @@ def create_or_get_thread_for_listing(listing_id: uuid.UUID, current_user: dict, 
         if th:
             thread_id = th["thread_id"]
             if start_date and end_date:
-                cur.execute("UPDATE message_threads SET start_date=%s, end_date=%s WHERE thread_id=%s",
-                            (start_date, end_date, thread_id))
+                cur.execute(
+                    "UPDATE message_threads SET start_date=%s, end_date=%s WHERE thread_id=%s",
+                    (start_date, end_date, thread_id)
+                )
                 conn.commit()
             return thread_id
 
-        # create new
         cur.execute("""
             INSERT INTO message_threads(listing_id, lister_id, renter_id, lister_email, renter_email, start_date, end_date, status, is_unlocked)
             VALUES (%s,%s,%s,%s,%s,%s,%s,'pending',FALSE)
@@ -651,7 +647,14 @@ def create_or_get_thread_for_listing(listing_id: uuid.UUID, current_user: dict, 
         conn.commit()
         return thread_id
 
-def send_rent_request_email_with_actions(listing_name: str, lister_email: str, renter_email: str, thread_id: uuid.UUID, start_date: Optional[str], end_date: Optional[str]):
+def send_rent_request_email_with_actions(
+    listing_name: str,
+    lister_email: str,
+    renter_email: str,
+    thread_id: uuid.UUID,
+    start_date: Optional[str],
+    end_date: Optional[str]
+):
     masked = mask_email(renter_email)
     dashboard_url = f"{FRONTEND_URL}/dashboard.html"
     approve_token = make_action_token("approve", thread_id)
@@ -692,16 +695,27 @@ def request_to_rent(data: RentRequestIn, user=Depends(get_current_user)):
 
     thread_id = create_or_get_thread_for_listing(data.listing_id, user, start_date, end_date)
 
-    # email to lister with Approve/Decline actions
     try:
-        send_rent_request_email_with_actions(listing_name, lister_email, user.get("email"), thread_id, start_date, end_date)
+        send_rent_request_email_with_actions(
+            listing_name,
+            lister_email,
+            user.get("email"),
+            thread_id,
+            start_date,
+            end_date
+        )
     except Exception as e:
-        logging.error("send_rent_request_email_with_actions: failed to send email, continuing without blocking user flow: %s", e, exc_info=True)
+        logging.error(
+            "send_rent_request_email_with_actions: failed to send email, continuing without blocking user flow: %s",
+            e,
+            exc_info=True
+        )
 
-    # system message in thread
     with get_conn() as conn, conn.cursor() as cur:
-        cur.execute("INSERT INTO messages(thread_id, sender_id, body) VALUES (%s,%s,%s)",
-                    (thread_id, None, f"Rental request for {start_date} → {end_date}"))
+        cur.execute(
+            "INSERT INTO messages(thread_id, sender_id, body) VALUES (%s,%s,%s)",
+            (thread_id, None, f"Rental request for {start_date} → {end_date}")
+        )
         conn.commit()
 
     return {"ok": True, "thread_id": str(thread_id)}
@@ -733,11 +747,25 @@ body{{font-family:system-ui,-apple-system,Segoe UI,Roboto,Ubuntu,Arial,sans-seri
 @app.get("/action/approve")
 def action_approve(tid: uuid.UUID = Query(...), token: str = Query(...)):
     if not verify_action_token("approve", tid, token):
-        return HTMLResponse(_action_result_page("Link invalid", "Sorry, this approval link is invalid or has expired.", f"{FRONTEND_URL}/dashboard.html"), status_code=400)
+        return HTMLResponse(
+            _action_result_page(
+                "Link invalid",
+                "Sorry, this approval link is invalid or has expired.",
+                f"{FRONTEND_URL}/dashboard.html"
+            ),
+            status_code=400
+        )
     with get_conn() as conn, conn.cursor() as cur:
         cur.execute("SELECT thread_id FROM message_threads WHERE thread_id=%s", (tid,))
         if not cur.fetchone():
-            return HTMLResponse(_action_result_page("Not found", "This conversation thread no longer exists.", f"{FRONTEND_URL}/dashboard.html"), status_code=404)
+            return HTMLResponse(
+                _action_result_page(
+                    "Not found",
+                    "This conversation thread no longer exists.",
+                    f"{FRONTEND_URL}/dashboard.html"
+                ),
+                status_code=404
+            )
         cur.execute("UPDATE message_threads SET status='approved' WHERE thread_id=%s", (tid,))
         conn.commit()
     return HTMLResponse(_action_result_page("Approved", "You approved this rental request.", f"{FRONTEND_URL}/dashboard.html"))
@@ -745,11 +773,25 @@ def action_approve(tid: uuid.UUID = Query(...), token: str = Query(...)):
 @app.get("/action/decline")
 def action_decline(tid: uuid.UUID = Query(...), token: str = Query(...)):
     if not verify_action_token("decline", tid, token):
-        return HTMLResponse(_action_result_page("Link invalid", "Sorry, this decline link is invalid or has expired.", f"{FRONTEND_URL}/dashboard.html"), status_code=400)
+        return HTMLResponse(
+            _action_result_page(
+                "Link invalid",
+                "Sorry, this decline link is invalid or has expired.",
+                f"{FRONTEND_URL}/dashboard.html"
+            ),
+            status_code=400
+        )
     with get_conn() as conn, conn.cursor() as cur:
         cur.execute("SELECT thread_id FROM message_threads WHERE thread_id=%s", (tid,))
         if not cur.fetchone():
-            return HTMLResponse(_action_result_page("Not found", "This conversation thread no longer exists.", f"{FRONTEND_URL}/dashboard.html"), status_code=404)
+            return HTMLResponse(
+                _action_result_page(
+                    "Not found",
+                    "This conversation thread no longer exists.",
+                    f"{FRONTEND_URL}/dashboard.html"
+                ),
+                status_code=404
+            )
         cur.execute("UPDATE message_threads SET status='declined' WHERE thread_id=%s", (tid,))
         conn.commit()
     return HTMLResponse(_action_result_page("Declined", "You declined this rental request.", f"{FRONTEND_URL}/dashboard.html"))
@@ -775,8 +817,16 @@ def create_checkout_session(data: CheckoutIn, user=Depends(get_current_user)):
             FROM listings l
             WHERE l.id=%s
             RETURNING id
-        """, (data.listing_id, get_user_uuid(user), data.renter_email, data.amount_total, data.currency,
-              start_date, end_date, data.listing_id))
+        """, (
+            data.listing_id,
+            get_user_uuid(user),
+            data.renter_email,
+            data.amount_total,
+            data.currency,
+            start_date,
+            end_date,
+            data.listing_id
+        ))
         rental_id = cur.fetchone()["id"]
         cur.execute("UPDATE message_threads SET rental_id=%s WHERE thread_id=%s", (rental_id, thread_id))
         conn.commit()
@@ -907,9 +957,6 @@ def root():
 @app.get("/healthz")
 def healthz():
     return PlainTextResponse("ok")
-
-
-
 
 
 
