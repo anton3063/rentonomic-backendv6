@@ -497,10 +497,9 @@ def options_listings():
     return Response(
         status_code=204,
         headers={
-            "Access-Control-Allow-Origin": "https://rentonomic.com",
-            "Access-Control-Allow-Methods": "POST, OPTIONS",
-            "Access-Control-Allow-Headers": "authorization, content-type",
-            "Access-Control-Max-Age": "86400",
+            "Access-Control-Allow-Origin": "*",
+            "Access-Control-Allow-Methods": "*",
+            "Access-Control-Allow-Headers": "*",
         },
     )
 
@@ -647,7 +646,7 @@ def get_thread(thread_id: uuid.UUID, user=Depends(get_current_user)):
         }
 
 @app.post("/threads/{thread_id}/message")
-def post_message(thread_id: uuid.UUID, data: MessageIn, user=Depends(get_current_user)):
+def post_message(thread_id: uuid.UUID, data: "MessageIn", user=Depends(get_current_user)):
     uid = get_user_uuid(user)
 
     with get_conn() as conn, conn.cursor(cursor_factory=psycopg2.extras.DictCursor) as cur:
