@@ -21,7 +21,7 @@ import uuid as _uuid
 def _adapt_uuid(u: _uuid.UUID): return AsIs(f"'{u}'::uuid")
 register_adapter(_uuid.UUID, _adapt_uuid)
 
-from fastapi import FastAPI, Depends, HTTPException, UploadFile, File, Form, Request, Query
+from fastapi import FastAPI, Depends, HTTPException, UploadFile, File, Form, Request, Query, Response
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, PlainTextResponse, HTMLResponse
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
@@ -76,6 +76,19 @@ app.add_middleware(
     expose_headers=["*"],
     max_age=86400,
 )
+
+# Explicit preflight handler to stop browser OPTIONS 405 on authenticated cross-origin requests
+@app.options("/{rest_of_path:path}")
+def preflight_handler(rest_of_path: str):
+    return Response(
+        status_code=204,
+        headers={
+            "Access-Control-Allow-Origin": "*",
+            "Access-Control-Allow-Methods": "*",
+            "Access-Control-Allow-Headers": "*",
+            "Access-Control-Max-Age": "86400",
+        },
+    )
 
 security = HTTPBearer()
 logging.basicConfig(level=logging.INFO)
