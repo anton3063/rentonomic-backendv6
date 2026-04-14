@@ -957,7 +957,13 @@ def root():
 @app.get("/healthz")
 def healthz():
     return PlainTextResponse("ok")
-
+@app.get("/__debug")
+def debug():
+    return {
+        "version": "14.3-cors-test-1",
+        "frontend_url": FRONTEND_URL,
+        "backend_url": BACKEND_URL,
+    }
 
 
 
