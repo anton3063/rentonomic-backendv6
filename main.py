@@ -379,6 +379,24 @@ def send_email_html(to_addr: str, subject: str, html: str):
     )
 
     try:
+        def send_email_html(to_addr: str, subject: str, html: str):
+    if not SENDGRID_API_KEY:
+        logging.error("SENDGRID_API_KEY not set")
+        raise HTTPException(500, "Email not configured")
+
+    mail = Mail(
+        from_email=Email(SENDGRID_FROM, "Rentonomic Alerts"),
+        to_emails=[To(to_addr)],
+        subject=subject,
+        html_content=Content("text/html", html),
+    )
+
+    try:
+        logging.warning("SENDGRID KEY PREFIX: %s", SENDGRID_API_KEY[:10] if SENDGRID_API_KEY else "NONE")
+        resp = sg_client().send(mail)
+        if resp.status_code not in (200, 202):
+            logging.error("SendGrid send failed: %s %s", resp.status_code, getattr(resp, "body", b"")[:200])
+            raise HTTPException(500, "Failed to send email")
         resp = sg_client().send(mail)
         if resp.status_code not in (200, 202):
             logging.error("SendGrid send failed: %s %s", resp.status_code, getattr(resp, "body", b"")[:200])
