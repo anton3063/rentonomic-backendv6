@@ -1223,8 +1223,8 @@ def create_checkout_session(data: CheckoutIn, user=Depends(get_current_user)):
 
     session = stripe.checkout.Session.create(
         mode="payment",
-        success_url=f"{FRONTEND_URL}/success?session_id={{CHECKOUT_SESSION_ID}}",
-        cancel_url=f"{FRONTEND_URL}/cancel",
+        success_url=f"{FRONTEND_URL}/dashboard.html",
+cancel_url=f"{FRONTEND_URL}/dashboard.html",
         payment_method_types=["card", "klarna", "link", "revolut_pay", "amazon_pay"],
         currency=data.currency,
         line_items=[
