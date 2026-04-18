@@ -1166,7 +1166,88 @@ def action_decline(tid: uuid.UUID = Query(...), token: str = Query(...)):
             f"{FRONTEND_URL}/dashboard.html",
         )
     )
+# -----------------------------
+# Stripe Connect onboarding
+# -----------------------------
+@app.post("/stripe/connect/start")
+def stripe_connect_start(user=Depends(get_current_user)):
+    if not STRIPE_SECRET_KEY:
+        raise HTTPException(500, "Stripe not configured")
 
+    uid = get_user_uuid(user)
+
+    with get_conn() as conn, conn.cursor(cursor_factory=psycopg2.extras.DictCursor) as cur:
+        cur.execute("SELECT email, stripe_account_id FROM users WHERE id=%s", (uid,))
+        row = cur.fetchone()
+        if not row:
+            raise HTTPException(404, "User not found")
+
+        email = row["email"]
+        stripe_account_id = row["stripe_account_id"]
+
+        if not stripe_account_id:
+            acct = stripe.Account.create(
+                type="express",
+                country="GB",
+                email=email,
+                capabilities={
+                    "card_payments": {"requested": True},
+                    "transfers": {"requested": True},
+                },
+                business_type="individual",
+            )
+            stripe_account_id = acct["id"]
+
+            cur.execute(
+                "UPDATE users SET stripe_account_id=%s WHERE id=%s",
+                (stripe_account_id, uid),
+            )
+            conn.commit()
+
+    account_link = stripe.AccountLink.create(
+        account=stripe_account_id,
+        refresh_url=f"{FRONTEND_URL}/dashboard.html",
+        return_url=f"{FRONTEND_URL}/dashboard.html",
+        type="account_onboarding",
+    )
+
+    return {
+        "url": account_link["url"],
+        "stripe_account_id": stripe_account_id,
+    }
+
+
+@app.get("/stripe/connect/status")
+def stripe_connect_status(user=Depends(get_current_user)):
+    if not STRIPE_SECRET_KEY:
+        raise HTTPException(500, "Stripe not configured")
+
+    uid = get_user_uuid(user)
+
+    with get_conn() as conn, conn.cursor(cursor_factory=psycopg2.extras.DictCursor) as cur:
+        cur.execute("SELECT stripe_account_id FROM users WHERE id=%s", (uid,))
+        row = cur.fetchone()
+        if not row:
+            raise HTTPException(404, "User not found")
+
+        stripe_account_id = row["stripe_account_id"]
+        if not stripe_account_id:
+            return {
+                "connected": False,
+                "charges_enabled": False,
+                "payouts_enabled": False,
+                "details_submitted": False,
+            }
+
+    acct = stripe.Account.retrieve(stripe_account_id)
+
+    return {
+        "connected": True,
+        "stripe_account_id": stripe_account_id,
+        "charges_enabled": bool(acct.get("charges_enabled")),
+        "payouts_enabled": bool(acct.get("payouts_enabled")),
+        "details_submitted": bool(acct.get("details_submitted")),
+    }
 
 # -----------------------------
 # Stripe checkout + webhook
