@@ -1261,7 +1261,6 @@ def create_checkout_session(data: CheckoutIn, user=Depends(get_current_user)):
 
     start_date = min(data.dates) if data.dates else None
     end_date = max(data.dates) if data.dates else None
-    requester_id = get_user_uuid(user)
 
     # Reuse the request-created rental/thread if one already exists for this renter + listing + dates.
     thread_id, rental_id, _, _, _ = create_or_get_request_bundle_for_listing(
@@ -1270,93 +1269,97 @@ def create_checkout_session(data: CheckoutIn, user=Depends(get_current_user)):
         start_date,
         end_date,
     )
-with get_conn() as conn, conn.cursor(cursor_factory=psycopg2.extras.DictCursor) as cur:
-    cur.execute(
-        """
-        SELECT l.owner_id, u.stripe_account_id, l.name, l.price_per_day
-        FROM listings l
-        LEFT JOIN users u ON u.id = l.owner_id
-        WHERE l.id = %s
-        """,
-        (data.listing_id,),
-    )
-    listing_row = cur.fetchone()
-    if not listing_row:
-        raise HTTPException(404, "Listing not found")
 
-    lister_stripe_account_id = listing_row["stripe_account_id"]
-    if not lister_stripe_account_id:
-        raise HTTPException(400, "Lister has not completed payment setup")
+    with get_conn() as conn, conn.cursor(cursor_factory=psycopg2.extras.DictCursor) as cur:
+        cur.execute(
+            """
+            SELECT l.owner_id, u.stripe_account_id, l.name, l.price_per_day
+            FROM listings l
+            LEFT JOIN users u ON u.id = l.owner_id
+            WHERE l.id = %s
+            """,
+            (data.listing_id,),
+        )
+        listing_row = cur.fetchone()
+        if not listing_row:
+            raise HTTPException(404, "Listing not found")
 
-    cur.execute(
-        """
-        UPDATE rentals
-        SET renter_email=%s,
-            amount_total=%s,
-            currency=%s,
-            start_date=%s,
-            end_date=%s
-        WHERE id=%s
-        RETURNING id
-        """,
-        (
-            data.renter_email,
-            data.amount_total,
-            data.currency,
-            start_date,
-            end_date,
-            rental_id,
-        ),
-    )
-    row = cur.fetchone()
-    if not row:
-        raise HTTPException(404, "Rental not found for checkout")
+        lister_stripe_account_id = listing_row["stripe_account_id"]
+        if not lister_stripe_account_id:
+            raise HTTPException(400, "Lister has not completed payment setup")
 
-    cur.execute(
-        "UPDATE message_threads SET rental_id=%s, start_date=%s, end_date=%s WHERE thread_id=%s",
-        (rental_id, start_date, end_date, thread_id),
-    )
-    conn.commit()
+        cur.execute(
+            """
+            UPDATE rentals
+            SET renter_email=%s,
+                amount_total=%s,
+                currency=%s,
+                start_date=%s,
+                end_date=%s
+            WHERE id=%s
+            RETURNING id
+            """,
+            (
+                data.renter_email,
+                data.amount_total,
+                data.currency,
+                start_date,
+                end_date,
+                rental_id,
+            ),
+        )
+        row = cur.fetchone()
+        if not row:
+            raise HTTPException(404, "Rental not found for checkout")
+
+        cur.execute(
+            "UPDATE message_threads SET rental_id=%s, start_date=%s, end_date=%s WHERE thread_id=%s",
+            (rental_id, start_date, end_date, thread_id),
+        )
+        conn.commit()
 
     session = stripe.checkout.Session.create(
-    mode="payment",
-    success_url=f"{FRONTEND_URL}/dashboard.html",
-    cancel_url=f"{FRONTEND_URL}/dashboard.html",
-    payment_method_types=["card", "klarna", "link", "revolut_pay", "amazon_pay"],
-    currency=data.currency,
-    line_items=[
-        {
-            "quantity": 1,
-            "price_data": {
-                "currency": data.currency,
-                "unit_amount": data.amount_total,
-                "product_data": {"name": "Rental payment"},
-            },
-        }
-    ],
-    metadata={
-        "listing_id": str(data.listing_id),
-        "renter_email": str(data.renter_email),
-        "dates": ",".join(data.dates or []),
-        "days": str(data.days),
-        "rental_id": str(rental_id),
-        "thread_id": str(thread_id),
-    },
-    payment_intent_data={
-        "application_fee_amount": int(round(data.amount_total - (data.amount_total / 1.10))),
-        "transfer_data": {
-            "destination": lister_stripe_account_id,
+        mode="payment",
+        success_url=f"{FRONTEND_URL}/dashboard.html",
+        cancel_url=f"{FRONTEND_URL}/dashboard.html",
+        payment_method_types=["card", "klarna", "link", "revolut_pay", "amazon_pay"],
+        currency=data.currency,
+        line_items=[
+            {
+                "quantity": 1,
+                "price_data": {
+                    "currency": data.currency,
+                    "unit_amount": data.amount_total,
+                    "product_data": {"name": "Rental payment"},
+                },
+            }
+        ],
+        metadata={
+            "listing_id": str(data.listing_id),
+            "renter_email": str(data.renter_email),
+            "dates": ",".join(data.dates or []),
+            "days": str(data.days),
+            "rental_id": str(rental_id),
+            "thread_id": str(thread_id),
         },
-        "on_behalf_of": lister_stripe_account_id,
-    },
-)
+        payment_intent_data={
+            "application_fee_amount": int(round(data.amount_total - (data.amount_total / 1.10))),
+            "transfer_data": {
+                "destination": lister_stripe_account_id,
+            },
+            "on_behalf_of": lister_stripe_account_id,
+        },
     )
 
     with get_conn() as conn, conn.cursor() as cur:
         cur.execute("UPDATE rentals SET checkout_session_id=%s WHERE id=%s", (session["id"], rental_id))
         conn.commit()
 
-    return {"checkout_url": session["url"], "rental_id": str(rental_id), "thread_id": str(thread_id)}
+    return {
+        "checkout_url": session["url"],
+        "rental_id": str(rental_id),
+        "thread_id": str(thread_id),
+    }
 
 
 @app.post("/stripe/webhook")
