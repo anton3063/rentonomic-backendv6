@@ -1381,7 +1381,7 @@ async def stripe_webhook(request: Request):
     data = event["data"]["object"]
     logging.info("Stripe event: %s", et)
 
-        if et == "checkout.session.completed":
+    if et == "checkout.session.completed":
         md = data["metadata"] if "metadata" in data else {}
 
         rental_id = md["rental_id"] if "rental_id" in md else None
@@ -1390,9 +1390,13 @@ async def stripe_webhook(request: Request):
         with get_conn() as conn, conn.cursor() as cur:
             if rental_id:
                 try:
-                    cur.execute("UPDATE rentals SET status='paid' WHERE id=%s", (uuid.UUID(rental_id),))
+                    cur.execute(
+                        "UPDATE rentals SET status='paid' WHERE id=%s",
+                        (uuid.UUID(rental_id),),
+                    )
                 except Exception:
-                    pass
+                    logging.exception("Failed updating rental to paid")
+
             if thread_id:
                 try:
                     cur.execute(
@@ -1400,7 +1404,8 @@ async def stripe_webhook(request: Request):
                         (uuid.UUID(thread_id),),
                     )
                 except Exception:
-                    pass
+                    logging.exception("Failed updating thread to paid")
+
             conn.commit()
 
     return PlainTextResponse("ok")
