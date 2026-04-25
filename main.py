@@ -1382,7 +1382,9 @@ async def stripe_webhook(request: Request):
     logging.info("Stripe event: %s", et)
 
     if et == "checkout.session.completed":
-        md = data.get("metadata") or {}
+        md = data["metadata"] if "metadata" in data else {}
+rental_id = md["rental_id"] if "rental_id" in md else None
+thread_id = md["thread_id"] if "thread_id" in md else None
         rental_id = md.get("rental_id")
         thread_id = md.get("thread_id")
 
