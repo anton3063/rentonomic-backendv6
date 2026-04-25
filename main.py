@@ -1242,12 +1242,12 @@ def stripe_connect_status(user=Depends(get_current_user)):
     acct = stripe.Account.retrieve(stripe_account_id)
 
     return {
-        "connected": True,
-        "stripe_account_id": stripe_account_id,
-        "charges_enabled": bool(acct.get("charges_enabled")),
-        "payouts_enabled": bool(acct.get("payouts_enabled")),
-        "details_submitted": bool(acct.get("details_submitted")),
-    }
+    "connected": True,
+    "stripe_account_id": stripe_account_id,
+    "charges_enabled": bool(acct["charges_enabled"]),
+    "payouts_enabled": bool(acct["payouts_enabled"]),
+    "details_submitted": bool(acct["details_submitted"]),
+}
 
 # -----------------------------
 # Stripe checkout + webhook
