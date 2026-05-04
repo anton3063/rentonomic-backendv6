@@ -750,13 +750,12 @@ async def signup(request: Request):
         raise HTTPException(400, "Password too short")
 
     pw_hash = hashlib.sha256(password.encode()).hexdigest()
+    verification_token = make_email_verification_token(email)
 
     with get_conn() as conn, conn.cursor(cursor_factory=psycopg2.extras.DictCursor) as cur:
         cur.execute("SELECT id FROM users WHERE lower(email)=lower(%s)", (email,))
         if cur.fetchone():
             raise HTTPException(400, "Email already registered")
-
-                verification_token = make_email_verification_token(email)
 
         cur.execute(
             """
