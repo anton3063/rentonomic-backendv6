@@ -223,7 +223,48 @@ def get_user_uuid(claims: dict) -> uuid.UUID:
         if not row:
             raise HTTPException(401, "Unknown user")
         return row[0]
+# -----------------------------
+# Email verification helpers
+# -----------------------------
+def make_email_verification_token(email: str, ttl_minutes: int = 24 * 60) -> str:
+    exp = int((datetime.utcnow() + timedelta(minutes=ttl_minutes)).timestamp())
+    raw = f"verify-email|{email}|{exp}".encode()
+    sig = hmac.new(JWT_SECRET.encode(), raw, hashlib.sha256).digest()
+    return f"{exp}.{_b64url(sig)}"
 
+
+def verify_email_verification_token(email: str, token: str) -> bool:
+    try:
+        exp_str, sig_b64 = token.split(".", 1)
+        exp = int(exp_str)
+
+        if datetime.utcfromtimestamp(exp) < datetime.utcnow():
+            return False
+
+        raw = f"verify-email|{email}|{exp}".encode()
+        expected = hmac.new(JWT_SECRET.encode(), raw, hashlib.sha256).digest()
+
+        return hmac.compare_digest(expected, _b64url_decode(sig_b64))
+    except Exception:
+        return False
+
+
+def send_verification_email(to_addr: str, token: str):
+    verify_url = f"{BACKEND_URL}/verify-email?email={to_addr}&token={token}"
+
+    html = f"""
+      <div style="font-family:system-ui,-apple-system,Segoe UI,Roboto,Ubuntu,Arial,sans-serif;line-height:1.5;color:#111">
+        <h2>Verify your Rentonomic email</h2>
+        <p>Thanks for signing up to Rentonomic.</p>
+        <p>Please confirm your email address by clicking the button below.</p>
+        <p style="margin:16px 0;">
+          <a href="{verify_url}" style="background:#1f2937;color:#fff;padding:10px 14px;border-radius:8px;text-decoration:none">Verify Email</a>
+        </p>
+        <p style="color:#555;font-size:12px">This link will expire after 24 hours.</p>
+      </div>
+    """
+
+    send_email_html(to_addr, "Verify your Rentonomic email", html)
 
 # -----------------------------
 # One-click action signing
@@ -715,16 +756,88 @@ async def signup(request: Request):
         if cur.fetchone():
             raise HTTPException(400, "Email already registered")
 
+                verification_token = make_email_verification_token(email)
+
         cur.execute(
-            "INSERT INTO users(email, password_hash) VALUES (%s,%s) RETURNING id, is_admin",
-            (email, pw_hash),
+            """
+            INSERT INTO users(
+                email,
+                password_hash,
+                email_verification_token,
+                email_verification_sent_at
+            )
+            VALUES (%s,%s,%s,now())
+            RETURNING id, is_admin
+            """,
+            (email, pw_hash, verification_token),
         )
         row = cur.fetchone()
         token = make_token(str(row["id"]), email, is_admin=row["is_admin"])
 
+    try:
+        send_verification_email(email, verification_token)
+    except Exception as e:
+        logging.error("send_verification_email failed, continuing: %s", e, exc_info=True)
+
     return {"token": token}
 
+@app.get("/verify-email")
+def verify_email(email: str = Query(...), token: str = Query(...)):
+    email = email.lower().strip()
 
+    with get_conn() as conn, conn.cursor(cursor_factory=psycopg2.extras.DictCursor) as cur:
+        cur.execute(
+            """
+            SELECT email, email_verification_token
+            FROM users
+            WHERE lower(email)=lower(%s)
+            """,
+            (email,),
+        )
+        row = cur.fetchone()
+
+        if not row:
+            return HTMLResponse(
+                "<h2>Verification failed</h2><p>User not found.</p>",
+                status_code=400,
+            )
+
+        stored_token = row["email_verification_token"]
+
+        if not stored_token or stored_token != token:
+            return HTMLResponse(
+                "<h2>Verification failed</h2><p>This verification link is invalid.</p>",
+                status_code=400,
+            )
+
+        if not verify_email_verification_token(email, token):
+            return HTMLResponse(
+                "<h2>Verification failed</h2><p>This verification link has expired.</p>",
+                status_code=400,
+            )
+
+        cur.execute(
+            """
+            UPDATE users
+            SET is_verified=TRUE,
+                email_verification_token=NULL
+            WHERE lower(email)=lower(%s)
+            """,
+            (email,),
+        )
+        conn.commit()
+
+    return HTMLResponse(
+        f"""
+        <html>
+          <body style="font-family:system-ui,-apple-system,Segoe UI,Roboto,Ubuntu,Arial,sans-serif;padding:32px;">
+            <h2>Email verified</h2>
+            <p>Your Rentonomic email has been verified successfully.</p>
+            <p><a href="{FRONTEND_URL}" style="background:#1f2937;color:#fff;padding:10px 14px;border-radius:8px;text-decoration:none">Return to Rentonomic</a></p>
+          </body>
+        </html>
+        """
+    )
 @app.post("/login")
 async def login(request: Request):
     mode = _extract_email_password_mode(request)
