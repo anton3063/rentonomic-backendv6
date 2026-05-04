@@ -854,7 +854,9 @@ def verify_email(email: str = Query(...), token: str = Query(...)):
         </html>
         """
     )
-    @app.post("/resend-verification")
+
+
+@app.post("/resend-verification")
 async def resend_verification(request: Request):
     mode = _extract_email_password_mode(request)
 
