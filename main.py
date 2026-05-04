@@ -977,8 +977,7 @@ def create_listing(
     price_per_day: float = Form(...),
     image: UploadFile = File(None),
     user=Depends(get_current_user),
-):    
-require_verified_user(user)
+):    require_verified_user(user)
     owner_id = get_user_uuid(user)
     owner_email = user.get("email")
     image_url = None
