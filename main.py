@@ -193,7 +193,24 @@ def get_current_user(creds: HTTPAuthorizationCredentials = Depends(security)):
 def admin_guard(user: dict):
     if not user.get("is_admin"):
         raise HTTPException(403, "Admin only")
+def require_verified_user(user: dict):
+    email = (user.get("email") or "").lower().strip()
 
+    if not email:
+        raise HTTPException(401, "Invalid user")
+
+    with get_conn() as conn, conn.cursor(cursor_factory=psycopg2.extras.DictCursor) as cur:
+        cur.execute(
+            "SELECT is_verified FROM users WHERE lower(email)=lower(%s)",
+            (email,),
+        )
+        row = cur.fetchone()
+
+        if not row:
+            raise HTTPException(401, "User not found")
+
+        if not row["is_verified"]:
+            raise HTTPException(403, "Please verify your email before listing an item")
 
 # -----------------------------
 # Canonical user UUID extractor
@@ -960,7 +977,8 @@ def create_listing(
     price_per_day: float = Form(...),
     image: UploadFile = File(None),
     user=Depends(get_current_user),
-):
+):    
+require_verified_user(user)
     owner_id = get_user_uuid(user)
     owner_email = user.get("email")
     image_url = None
