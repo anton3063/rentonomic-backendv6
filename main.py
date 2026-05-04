@@ -854,6 +854,53 @@ def verify_email(email: str = Query(...), token: str = Query(...)):
         </html>
         """
     )
+    @app.post("/resend-verification")
+async def resend_verification(request: Request):
+    mode = _extract_email_password_mode(request)
+
+    if mode == "json":
+        data = await request.json()
+        email = str(data.get("email", "")).lower().strip()
+    else:
+        form = await request.form()
+        email = str((form.get("email") or "")).lower().strip()
+
+    if not email:
+        raise HTTPException(400, "Email required")
+
+    verification_token = make_email_verification_token(email)
+
+    with get_conn() as conn, conn.cursor(cursor_factory=psycopg2.extras.DictCursor) as cur:
+        cur.execute(
+            """
+            SELECT id, is_verified
+            FROM users
+            WHERE lower(email)=lower(%s)
+            """,
+            (email,),
+        )
+        row = cur.fetchone()
+
+        if not row:
+            raise HTTPException(404, "Email not registered")
+
+        if row["is_verified"]:
+            return {"ok": True, "message": "Email already verified"}
+
+        cur.execute(
+            """
+            UPDATE users
+            SET email_verification_token=%s,
+                email_verification_sent_at=now()
+            WHERE lower(email)=lower(%s)
+            """,
+            (verification_token, email),
+        )
+        conn.commit()
+
+    send_verification_email(email, verification_token)
+
+    return {"ok": True, "message": "Verification email sent"}
 @app.post("/login")
 async def login(request: Request):
     mode = _extract_email_password_mode(request)
