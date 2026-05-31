@@ -1181,7 +1181,7 @@ cur.execute(
     """,
     (thread_id, uid),
 )
-    cur.execute(
+cur.execute(
                 """
                 SELECT id, sender_id, body, created_at
                 FROM messages
