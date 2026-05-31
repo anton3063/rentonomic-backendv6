@@ -1240,6 +1240,7 @@ def post_message(thread_id: uuid.UUID, data: MessageIn, user=Depends(get_current
             (thread_id, uid, data.body),
         )
         mid, created_at = cur.fetchone()
+
         cur.execute(
             """
             INSERT INTO message_reads(thread_id, user_id, last_read_at)
@@ -1249,7 +1250,8 @@ def post_message(thread_id: uuid.UUID, data: MessageIn, user=Depends(get_current
             """,
             (thread_id, uid),
         )
-         conn.commit()
+
+        conn.commit()
 
         return {"id": str(mid), "created_at": created_at.isoformat()}
 
