@@ -1108,16 +1108,16 @@ def list_threads(user=Depends(get_current_user)):
            SELECT COUNT(*)
            FROM messages m
            LEFT JOIN message_reads mr
-             ON mr.thread_id = t.id::uuid
+             ON mr.thread_id = t.thread_id
             AND mr.user_id = %s
-           WHERE m.thread_id = t.id::uuid
+           WHERE m.thread_id = t.thread_id
              AND m.sender_id IS DISTINCT FROM %s
              AND (
                  mr.last_read_at IS NULL
                  OR m.created_at > mr.last_read_at
              )
        ), 0) AS unread_count
-                FROM message_threads t
+                FROM rental_requests t
                 JOIN listings l ON l.id = t.listing_id
                 WHERE (t.lister_id = %s OR t.renter_id = %s)
                   AND t.status NOT IN ('declined', 'expired')
