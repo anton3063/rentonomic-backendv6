@@ -1240,18 +1240,16 @@ def post_message(thread_id: uuid.UUID, data: MessageIn, user=Depends(get_current
             (thread_id, uid, data.body),
         )
         mid, created_at = cur.fetchone()
-
-cur.execute(
-    """
-    INSERT INTO message_reads(thread_id, user_id, last_read_at)
-    VALUES (%s, %s, NOW())
-    ON CONFLICT (thread_id, user_id)
-    DO UPDATE SET last_read_at = NOW()
-    """,
-    (thread_id, uid),
-)
-
-conn.commit()
+        cur.execute(
+            """
+            INSERT INTO message_reads(thread_id, user_id, last_read_at)
+            VALUES (%s, %s, NOW())
+            ON CONFLICT (thread_id, user_id)
+            DO UPDATE SET last_read_at = NOW()
+            """,
+            (thread_id, uid),
+        )
+         conn.commit()
 
         return {"id": str(mid), "created_at": created_at.isoformat()}
 
