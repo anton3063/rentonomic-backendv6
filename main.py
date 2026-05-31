@@ -1100,7 +1100,7 @@ def list_threads(user=Depends(get_current_user)):
         with conn.cursor(cursor_factory=psycopg2.extras.DictCursor) as cur:
             cur.execute(
                 """
-                SELECT t.id AS thread_id, t.listing_id, t.lister_id, t.renter_id,
+                SELECT t.thread_id, t.listing_id, t.rental_id, t.lister_id, t.renter_id,
                        t.lister_email, t.renter_email, t.start_date, t.end_date,
                        t.is_unlocked, t.status,
                               l.name as listing_name, l.location as listing_location,
@@ -1117,7 +1117,7 @@ def list_threads(user=Depends(get_current_user)):
                  OR m.created_at > mr.last_read_at
              )
        ), 0) AS unread_count
-                FROM rental_requests t
+                FROM message_threads t
                 JOIN listings l ON l.id = t.listing_id
                 WHERE (t.lister_id = %s OR t.renter_id = %s)
                   AND t.status NOT IN ('declined', 'expired')
