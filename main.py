@@ -1108,9 +1108,9 @@ def list_threads(user=Depends(get_current_user)):
            SELECT COUNT(*)
            FROM messages m
            LEFT JOIN message_reads mr
-             ON mr.thread_id = t.thread_id
+             ON mr.thread_id = t.thread_id::uuid
             AND mr.user_id = %s
-           WHERE m.thread_id = t.thread_id
+           WHERE m.thread_id = t.thread_id::uuid
              AND m.sender_id IS DISTINCT FROM %s
              AND (
                  mr.last_read_at IS NULL
