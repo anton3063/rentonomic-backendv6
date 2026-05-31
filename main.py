@@ -1172,22 +1172,23 @@ def get_thread(thread_id: uuid.UUID, user=Depends(get_current_user)):
 
             if not th:
                 raise HTTPException(404, "Thread not found")
-cur.execute(
-    """
-    INSERT INTO message_reads(thread_id, user_id, last_read_at)
-    VALUES (%s, %s, NOW())
-    ON CONFLICT (thread_id, user_id)
-    DO UPDATE SET last_read_at = NOW()
-    """,
-    (thread_id, uid),
-)
-cur.execute(
+            cur.execute(
+                """
+                INSERT INTO message_reads(thread_id, user_id, last_read_at)
+                VALUES (%s, %s, NOW())
+                ON CONFLICT (thread_id, user_id)
+                DO UPDATE SET last_read_at = NOW()
+                """,
+                (thread_id, uid),
+            )
+
+            cur.execute(
                 """
                 SELECT id, sender_id, body, created_at
                 FROM messages
                 WHERE thread_id = %s
                 ORDER BY created_at ASC
-            """,
+                """,
                 (thread_id,),
             )
             msgs = cur.fetchall()
