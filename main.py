@@ -1103,14 +1103,27 @@ def list_threads(user=Depends(get_current_user)):
                 SELECT t.thread_id, t.listing_id, t.rental_id, t.lister_id, t.renter_id,
                        t.lister_email, t.renter_email, t.start_date, t.end_date,
                        t.is_unlocked, t.status,
-                       l.name as listing_name, l.location as listing_location
+                              l.name as listing_name, l.location as listing_location,
+       COALESCE((
+           SELECT COUNT(*)
+           FROM messages m
+           LEFT JOIN message_reads mr
+             ON mr.thread_id = t.thread_id
+            AND mr.user_id = %s
+           WHERE m.thread_id = t.thread_id
+             AND m.sender_id IS DISTINCT FROM %s
+             AND (
+                 mr.last_read_at IS NULL
+                 OR m.created_at > mr.last_read_at
+             )
+       ), 0) AS unread_count
                 FROM message_threads t
                 JOIN listings l ON l.id = t.listing_id
                 WHERE (t.lister_id = %s OR t.renter_id = %s)
                   AND t.status NOT IN ('declined', 'expired')
                 ORDER BY t.created_at DESC
             """,
-                (uid, uid),
+                (uid, uid, uid, uid),
             )
             rows = cur.fetchall()
 
@@ -1129,6 +1142,7 @@ def list_threads(user=Depends(get_current_user)):
                         "rental_id": str(r["rental_id"]) if r["rental_id"] else None,
                         "is_unlocked": bool(r["is_unlocked"]),
                         "status": r["status"],
+                        "unread_count": int(r["unread_count"]),
                         "start_date": r["start_date"].isoformat() if r["start_date"] else None,
                         "end_date": r["end_date"].isoformat() if r["end_date"] else None,
                         "counterparty": mask_email(counter),
@@ -1158,7 +1172,15 @@ def get_thread(thread_id: uuid.UUID, user=Depends(get_current_user)):
 
             if not th:
                 raise HTTPException(404, "Thread not found")
-
+cur.execute(
+    """
+    INSERT INTO message_reads(thread_id, user_id, last_read_at)
+    VALUES (%s, %s, NOW())
+    ON CONFLICT (thread_id, user_id)
+    DO UPDATE SET last_read_at = NOW()
+    """,
+    (thread_id, uid),
+)
             cur.execute(
                 """
                 SELECT id, sender_id, body, created_at
@@ -1217,7 +1239,18 @@ def post_message(thread_id: uuid.UUID, data: MessageIn, user=Depends(get_current
             (thread_id, uid, data.body),
         )
         mid, created_at = cur.fetchone()
-        conn.commit()
+
+cur.execute(
+    """
+    INSERT INTO message_reads(thread_id, user_id, last_read_at)
+    VALUES (%s, %s, NOW())
+    ON CONFLICT (thread_id, user_id)
+    DO UPDATE SET last_read_at = NOW()
+    """,
+    (thread_id, uid),
+)
+
+conn.commit()
 
         return {"id": str(mid), "created_at": created_at.isoformat()}
 
