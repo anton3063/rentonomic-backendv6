@@ -606,7 +606,7 @@ def create_or_get_request_bundle_for_listing(
             SELECT thread_id, rental_id, status
             FROM message_threads
             WHERE listing_id=%s AND lister_id=%s AND renter_id=%s
-              AND status NOT IN ('declined', 'expired', 'paid')
+              AND status NOT IN ('declined', 'expired')
             ORDER BY created_at DESC
             LIMIT 1
             """,
