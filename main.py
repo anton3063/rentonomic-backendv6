@@ -1689,7 +1689,57 @@ def decline_rental(rental_id: uuid.UUID, user=Depends(get_current_user)):
 
     return {"ok": True}
 
+# -----------------------------
+# Admin rental reporting
+# -----------------------------
+@app.get("/admin/all-rental-requests")
+def admin_all_rental_requests(user=Depends(get_current_user)):
+    admin_guard(user)
 
+    with get_conn() as conn, conn.cursor(cursor_factory=psycopg2.extras.DictCursor) as cur:
+        cur.execute(
+            """
+            SELECT
+                r.id AS rental_id,
+                t.thread_id AS thread_id,
+                r.listing_id,
+                l.name AS listing_name,
+                COALESCE(r.renter_email, t.renter_email) AS renter_email,
+                COALESCE(r.lister_email, t.lister_email, l.owner_email) AS lister_email,
+                r.start_date,
+                r.end_date,
+                r.status,
+                r.amount_total,
+                r.currency,
+                r.created_at,
+                r.updated_at
+            FROM rentals r
+            LEFT JOIN listings l ON l.id = r.listing_id
+            LEFT JOIN message_threads t ON t.rental_id = r.id
+            ORDER BY r.created_at DESC
+            """
+        )
+        rows = cur.fetchall()
+
+    return [
+        {
+            "id": str(r["rental_id"]),
+            "rental_id": str(r["rental_id"]),
+            "thread_id": str(r["thread_id"]) if r["thread_id"] else None,
+            "listing_id": str(r["listing_id"]) if r["listing_id"] else None,
+            "listing_name": r["listing_name"],
+            "renter_email": r["renter_email"],
+            "lister_email": r["lister_email"],
+            "start_date": r["start_date"].isoformat() if r["start_date"] else None,
+            "end_date": r["end_date"].isoformat() if r["end_date"] else None,
+            "status": r["status"],
+            "amount_total": float(r["amount_total"] or 0) / 100,
+            "currency": r["currency"] or "gbp",
+            "created_at": r["created_at"].isoformat() if r["created_at"] else None,
+            "updated_at": r["updated_at"].isoformat() if r["updated_at"] else None,
+        }
+        for r in rows
+    ]
 # -----------------------------
 # Health
 # -----------------------------
