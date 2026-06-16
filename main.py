@@ -1688,7 +1688,42 @@ def decline_rental(rental_id: uuid.UUID, user=Depends(get_current_user)):
         )
 
     return {"ok": True}
+    
+# -----------------------------
+# Admin user management
+# -----------------------------
+@app.get("/users")
+def admin_users(user=Depends(get_current_user)):
+    admin_guard(user)
 
+    with get_conn() as conn, conn.cursor(cursor_factory=psycopg2.extras.DictCursor) as cur:
+        cur.execute(
+            """
+            SELECT
+                id,
+                email,
+                is_admin,
+                is_verified,
+                stripe_account_id,
+                created_at
+            FROM users
+            ORDER BY created_at DESC
+            """
+        )
+        rows = cur.fetchall()
+
+    return [
+        {
+            "id": str(r["id"]),
+            "email": r["email"],
+            "is_admin": bool(r["is_admin"]),
+            "is_verified": bool(r["is_verified"]),
+            "stripe_connected": bool(r["stripe_account_id"]),
+            "created_at": r["created_at"].isoformat() if r["created_at"] else None,
+        }
+        for r in rows
+    ]
+    
 # -----------------------------
 # Admin rental reporting
 # -----------------------------
