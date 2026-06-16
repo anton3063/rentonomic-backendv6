@@ -1790,6 +1790,7 @@ def admin_users(user=Depends(get_current_user)):
                 is_admin,
                 is_verified,
                 stripe_account_id,
+                is_suspended,
                 created_at
             FROM users
             ORDER BY created_at DESC
@@ -1804,6 +1805,7 @@ def admin_users(user=Depends(get_current_user)):
             "is_admin": bool(r["is_admin"]),
             "is_verified": bool(r["is_verified"]),
             "stripe_connected": bool(r["stripe_account_id"]),
+            "is_suspended": bool(r["is_suspended"]),
             "created_at": r["created_at"].isoformat() if r["created_at"] else None,
         }
         for r in rows
