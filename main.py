@@ -1809,7 +1809,32 @@ def admin_users(user=Depends(get_current_user)):
         for r in rows
     ]
 
+@app.post("/admin/users/{user_id}/suspend")
+def admin_suspend_user(user_id: uuid.UUID, user=Depends(get_current_user)):
+    admin_guard(user)
 
+    current_admin_id = get_user_uuid(user)
+
+    if str(current_admin_id) == str(user_id):
+        raise HTTPException(400, "You cannot suspend your own admin account")
+
+    with get_conn() as conn, conn.cursor() as cur:
+        cur.execute(
+            """
+            UPDATE users
+            SET is_suspended = TRUE
+            WHERE id = %s
+            RETURNING id
+            """,
+            (user_id,),
+        )
+        row = cur.fetchone()
+        conn.commit()
+
+    if not row:
+        raise HTTPException(404, "User not found")
+
+    return {"ok": True, "message": "User suspended"}
 
 @app.post("/admin/users/{user_id}/reinstate")
 def admin_reinstate_user(user_id: uuid.UUID, user=Depends(get_current_user)):
