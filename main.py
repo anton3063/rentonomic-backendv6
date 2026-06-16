@@ -1860,6 +1860,96 @@ def admin_reinstate_user(user_id: uuid.UUID, user=Depends(get_current_user)):
 
     return {"ok": True, "message": "User reinstated"}
     # -----------------------------
+# Public reporting
+# -----------------------------
+@app.post("/report-listing")
+async def report_listing(request: Request):
+    data = await request.json()
+
+    listing_id = data.get("listing_id")
+    reason = (data.get("reason") or "").strip()
+    submitted_by = (data.get("submitted_by") or "").strip()
+
+    if not listing_id:
+        raise HTTPException(400, "Listing ID required")
+
+    if not reason:
+        raise HTTPException(400, "Reason required")
+
+    try:
+        target_id = uuid.UUID(str(listing_id))
+    except Exception:
+        raise HTTPException(400, "Invalid listing ID")
+
+    with get_conn() as conn, conn.cursor() as cur:
+        cur.execute(
+            """
+            INSERT INTO reports (
+                id,
+                report_type,
+                target_id,
+                reason,
+                submitted_by,
+                status,
+                created_at
+            )
+            VALUES (%s, 'listing', %s, %s, %s, 'open', now())
+            RETURNING id
+            """,
+            (
+                uuid.uuid4(),
+                target_id,
+                reason,
+                submitted_by,
+            ),
+        )
+        report_id = cur.fetchone()[0]
+        conn.commit()
+
+    return {"ok": True, "report_id": str(report_id)}
+
+
+@app.post("/report-user")
+async def report_user(request: Request):
+    data = await request.json()
+
+    target_email = (data.get("target_email") or "").strip().lower()
+    reason = (data.get("reason") or "").strip()
+    submitted_by = (data.get("submitted_by") or "").strip()
+
+    if not target_email:
+        raise HTTPException(400, "Target email required")
+
+    if not reason:
+        raise HTTPException(400, "Reason required")
+
+    with get_conn() as conn, conn.cursor() as cur:
+        cur.execute(
+            """
+            INSERT INTO reports (
+                id,
+                report_type,
+                target_email,
+                reason,
+                submitted_by,
+                status,
+                created_at
+            )
+            VALUES (%s, 'user', %s, %s, %s, 'open', now())
+            RETURNING id
+            """,
+            (
+                uuid.uuid4(),
+                target_email,
+                reason,
+                submitted_by,
+            ),
+        )
+        report_id = cur.fetchone()[0]
+        conn.commit()
+
+    return {"ok": True, "report_id": str(report_id)}
+    # -----------------------------
 # Admin reports queue
 # -----------------------------
 @app.get("/admin/reports")
