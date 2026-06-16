@@ -1899,7 +1899,7 @@ def admin_reports(user=Depends(get_current_user)):
         for r in rows
     ]
 
-    @app.post("/admin/reports/{report_id}/dismiss")
+@app.post("/admin/reports/{report_id}/dismiss")
 def admin_dismiss_report(report_id: uuid.UUID, user=Depends(get_current_user)):
     admin_guard(user)
 
