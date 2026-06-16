@@ -950,6 +950,7 @@ def get_listings():
                    (price_per_day * 1.10) as renter_price_per_day,
                    image_url, created_at, owner_email, owner_id
             FROM listings
+            WHERE deleted_at IS NULL
             ORDER BY created_at DESC
             LIMIT 100
         """
