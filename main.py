@@ -1969,6 +1969,55 @@ def admin_report_hide_listing(report_id: uuid.UUID, user=Depends(get_current_use
         conn.commit()
 
     return {"ok": True, "message": "Listing hidden from report"}
+@app.post("/admin/reports/{report_id}/suspend-user")
+def admin_report_suspend_user(report_id: uuid.UUID, user=Depends(get_current_user)):
+    admin_guard(user)
+
+    with get_conn() as conn, conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT target_id
+            FROM reports
+            WHERE id = %s
+            """,
+            (report_id,),
+        )
+        report = cur.fetchone()
+
+        if not report:
+            raise HTTPException(404, "Report not found")
+
+        target_id = report[0]
+
+        if not target_id:
+            raise HTTPException(400, "This report has no user ID attached")
+
+        cur.execute(
+            """
+            UPDATE users
+            SET is_suspended = TRUE
+            WHERE id = %s
+            RETURNING id
+            """,
+            (target_id,),
+        )
+        usr = cur.fetchone()
+
+        if not usr:
+            raise HTTPException(404, "User not found")
+
+        cur.execute(
+            """
+            UPDATE reports
+            SET status = 'user_suspended'
+            WHERE id = %s
+            """,
+            (report_id,),
+        )
+
+        conn.commit()
+
+    return {"ok": True, "message": "User suspended from report"}
 # -----------------------------
 # Admin rental reporting
 # -----------------------------
