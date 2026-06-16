@@ -1087,6 +1087,55 @@ def delete_listing(listing_id: uuid.UUID, user=Depends(get_current_user)):
         conn.commit()
     return {"ok": True}
 
+    
+# -----------------------------
+# Admin listing moderation
+# -----------------------------
+@app.post("/admin/listings/{listing_id}/hide")
+def admin_hide_listing(listing_id: uuid.UUID, user=Depends(get_current_user)):
+    admin_guard(user)
+
+    with get_conn() as conn, conn.cursor() as cur:
+        cur.execute(
+            """
+            UPDATE listings
+            SET deleted_at = now()
+            WHERE id = %s
+            RETURNING id
+            """,
+            (listing_id,),
+        )
+        row = cur.fetchone()
+        conn.commit()
+
+    if not row:
+        raise HTTPException(404, "Listing not found")
+
+    return {"ok": True, "message": "Listing hidden"}
+
+
+@app.post("/admin/listings/{listing_id}/restore")
+def admin_restore_listing(listing_id: uuid.UUID, user=Depends(get_current_user)):
+    admin_guard(user)
+
+    with get_conn() as conn, conn.cursor() as cur:
+        cur.execute(
+            """
+            UPDATE listings
+            SET deleted_at = NULL
+            WHERE id = %s
+            RETURNING id
+            """,
+            (listing_id,),
+        )
+        row = cur.fetchone()
+        conn.commit()
+
+    if not row:
+        raise HTTPException(404, "Listing not found")
+
+    return {"ok": True, "message": "Listing restored"}
+
 
 # -----------------------------
 # Message threads & chat
