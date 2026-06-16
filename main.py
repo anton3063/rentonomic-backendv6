@@ -1092,6 +1092,41 @@ def delete_listing(listing_id: uuid.UUID, user=Depends(get_current_user)):
 # -----------------------------
 # Admin listing moderation
 # -----------------------------
+@app.get("/admin/listings")
+def admin_all_listings(user=Depends(get_current_user)):
+    admin_guard(user)
+
+    with get_conn() as conn, conn.cursor(cursor_factory=psycopg2.extras.DictCursor) as cur:
+        cur.execute(
+            """
+            SELECT id, name, location, description, price_per_day,
+                   (price_per_day * 1.10) as renter_price_per_day,
+                   image_url, created_at, owner_email, owner_id, deleted_at
+            FROM listings
+            ORDER BY created_at DESC
+            """
+        )
+        rows = cur.fetchall()
+
+    return [
+        {
+            "id": str(r["id"]),
+            "name": r["name"],
+            "location": r["location"],
+            "description": r["description"],
+            "price_per_day": float(r["price_per_day"]),
+            "renter_price_per_day": float(r["renter_price_per_day"]),
+            "image_url": r["image_url"],
+            "created_at": r["created_at"].isoformat() if r["created_at"] else None,
+            "owner_email": r["owner_email"],
+            "owner_id": str(r["owner_id"]) if r["owner_id"] else None,
+            "deleted_at": r["deleted_at"].isoformat() if r["deleted_at"] else None,
+            "is_hidden": bool(r["deleted_at"]),
+        }
+        for r in rows
+    ] 
+
+    
 @app.post("/admin/listings/{listing_id}/hide")
 def admin_hide_listing(listing_id: uuid.UUID, user=Depends(get_current_user)):
     admin_guard(user)
