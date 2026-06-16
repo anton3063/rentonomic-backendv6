@@ -1898,6 +1898,28 @@ def admin_reports(user=Depends(get_current_user)):
         }
         for r in rows
     ]
+
+    @app.post("/admin/reports/{report_id}/dismiss")
+def admin_dismiss_report(report_id: uuid.UUID, user=Depends(get_current_user)):
+    admin_guard(user)
+
+    with get_conn() as conn, conn.cursor() as cur:
+        cur.execute(
+            """
+            UPDATE reports
+            SET status = 'dismissed'
+            WHERE id = %s
+            RETURNING id
+            """,
+            (report_id,),
+        )
+        row = cur.fetchone()
+        conn.commit()
+
+    if not row:
+        raise HTTPException(404, "Report not found")
+
+    return {"ok": True, "message": "Report dismissed"}
 # -----------------------------
 # Admin rental reporting
 # -----------------------------
