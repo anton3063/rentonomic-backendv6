@@ -1859,6 +1859,45 @@ def admin_reinstate_user(user_id: uuid.UUID, user=Depends(get_current_user)):
         raise HTTPException(404, "User not found")
 
     return {"ok": True, "message": "User reinstated"}
+    # -----------------------------
+# Admin reports queue
+# -----------------------------
+@app.get("/admin/reports")
+def admin_reports(user=Depends(get_current_user)):
+    admin_guard(user)
+
+    with get_conn() as conn, conn.cursor(cursor_factory=psycopg2.extras.DictCursor) as cur:
+        cur.execute(
+            """
+            SELECT
+                id,
+                report_type,
+                target_id,
+                target_email,
+                reason,
+                submitted_by,
+                status,
+                created_at
+            FROM reports
+            ORDER BY created_at DESC
+            """
+        )
+
+        rows = cur.fetchall()
+
+    return [
+        {
+            "id": str(r["id"]),
+            "report_type": r["report_type"],
+            "target_id": str(r["target_id"]) if r["target_id"] else None,
+            "target_email": r["target_email"],
+            "reason": r["reason"],
+            "submitted_by": r["submitted_by"],
+            "status": r["status"],
+            "created_at": r["created_at"].isoformat() if r["created_at"] else None,
+        }
+        for r in rows
+    ]
 # -----------------------------
 # Admin rental reporting
 # -----------------------------
