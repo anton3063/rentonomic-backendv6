@@ -1920,6 +1920,55 @@ def admin_dismiss_report(report_id: uuid.UUID, user=Depends(get_current_user)):
         raise HTTPException(404, "Report not found")
 
     return {"ok": True, "message": "Report dismissed"}
+@app.post("/admin/reports/{report_id}/hide-listing")
+def admin_report_hide_listing(report_id: uuid.UUID, user=Depends(get_current_user)):
+    admin_guard(user)
+
+    with get_conn() as conn, conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT target_id
+            FROM reports
+            WHERE id = %s
+            """,
+            (report_id,),
+        )
+        report = cur.fetchone()
+
+        if not report:
+            raise HTTPException(404, "Report not found")
+
+        target_id = report[0]
+
+        if not target_id:
+            raise HTTPException(400, "This report has no listing ID attached")
+
+        cur.execute(
+            """
+            UPDATE listings
+            SET deleted_at = now()
+            WHERE id = %s
+            RETURNING id
+            """,
+            (target_id,),
+        )
+        listing = cur.fetchone()
+
+        if not listing:
+            raise HTTPException(404, "Listing not found")
+
+        cur.execute(
+            """
+            UPDATE reports
+            SET status = 'listing_hidden'
+            WHERE id = %s
+            """,
+            (report_id,),
+        )
+
+        conn.commit()
+
+    return {"ok": True, "message": "Listing hidden from report"}
 # -----------------------------
 # Admin rental reporting
 # -----------------------------
