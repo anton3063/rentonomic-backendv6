@@ -1492,6 +1492,10 @@ def stripe_connect_start(user=Depends(get_current_user)):
                     "transfers": {"requested": True},
                 },
                 business_type="individual",
+                business_profile={
+                    "product_description": "Individual renting personal items through Rentonomic"
+},
+)
             )
             stripe_account_id = acct["id"]
 
