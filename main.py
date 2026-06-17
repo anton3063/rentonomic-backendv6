@@ -1496,7 +1496,7 @@ def stripe_connect_start(user=Depends(get_current_user)):
                     "product_description": "Individual renting personal items through Rentonomic"
 },
 )
-            )
+            
             stripe_account_id = acct["id"]
 
             cur.execute(
