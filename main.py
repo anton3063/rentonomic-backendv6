@@ -283,6 +283,51 @@ def send_verification_email(to_addr: str, token: str):
 
     send_email_html(to_addr, "Verify your Rentonomic email", html)
 
+
+
+# -----------------------------
+# Password reset helpers
+# -----------------------------
+def make_password_reset_token(email: str, ttl_minutes: int = 60) -> str:
+    exp = int((datetime.utcnow() + timedelta(minutes=ttl_minutes)).timestamp())
+    raw = f"password-reset|{email}|{exp}".encode()
+    sig = hmac.new(JWT_SECRET.encode(), raw, hashlib.sha256).digest()
+    return f"{exp}.{_b64url(sig)}"
+
+
+def verify_password_reset_token(email: str, token: str) -> bool:
+    try:
+        exp_str, sig_b64 = token.split(".", 1)
+        exp = int(exp_str)
+
+        if datetime.utcfromtimestamp(exp) < datetime.utcnow():
+            return False
+
+        raw = f"password-reset|{email}|{exp}".encode()
+        expected = hmac.new(JWT_SECRET.encode(), raw, hashlib.sha256).digest()
+
+        return hmac.compare_digest(expected, _b64url_decode(sig_b64))
+    except Exception:
+        return False
+
+
+def send_password_reset_email(to_addr: str, token: str):
+    reset_url = f"{BACKEND_URL}/reset-password?email={to_addr}&token={token}"
+
+    html = f"""
+      <div style="font-family:system-ui,-apple-system,Segoe UI,Roboto,Ubuntu,Arial,sans-serif;line-height:1.5;color:#111">
+        <h2>Reset your Rentonomic password</h2>
+        <p>We received a request to reset your Rentonomic password.</p>
+        <p>Click the button below to choose a new password.</p>
+        <p style="margin:16px 0;">
+          <a href="{reset_url}" style="background:#1f2937;color:#fff;padding:10px 14px;border-radius:8px;text-decoration:none">Reset Password</a>
+        </p>
+        <p style="color:#555;font-size:12px">This link will expire after 60 minutes. If you did not request this, you can ignore this email.</p>
+      </div>
+    """
+
+    send_email_html(to_addr, "Reset your Rentonomic password", html)
+
 # -----------------------------
 # One-click action signing
 # -----------------------------
@@ -326,6 +371,8 @@ def migrate():
             """
             )
 
+            cur.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS password_reset_token TEXT;")
+            cur.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS password_reset_sent_at TIMESTAMPTZ;")
             cur.execute(
                 """
             CREATE TABLE IF NOT EXISTS listings (
@@ -903,6 +950,140 @@ async def resend_verification(request: Request):
     send_verification_email(email, verification_token)
 
     return {"ok": True, "message": "Verification email sent"}
+    
+@app.post("/forgot-password")
+async def forgot_password(request: Request):
+    mode = _extract_email_password_mode(request)
+
+    if mode == "json":
+        data = await request.json()
+        email = str(data.get("email", "")).lower().strip()
+    else:
+        form = await request.form()
+        email = str((form.get("email") or "")).lower().strip()
+
+    if not email:
+        raise HTTPException(400, "Email required")
+
+    reset_token = make_password_reset_token(email)
+
+    with get_conn() as conn, conn.cursor(cursor_factory=psycopg2.extras.DictCursor) as cur:
+        cur.execute(
+            "SELECT id FROM users WHERE lower(email)=lower(%s)",
+            (email,),
+        )
+        row = cur.fetchone()
+
+        if row:
+            cur.execute(
+                """
+                UPDATE users
+                SET password_reset_token=%s,
+                    password_reset_sent_at=now()
+                WHERE lower(email)=lower(%s)
+                """,
+                (reset_token, email),
+            )
+            conn.commit()
+
+            try:
+                send_password_reset_email(email, reset_token)
+            except Exception as e:
+                logging.error("send_password_reset_email failed: %s", e, exc_info=True)
+
+    return {"ok": True, "message": "If that email exists, a reset link has been sent"}
+    
+@app.get("/reset-password")
+def reset_password_page(email: str = Query(...), token: str = Query(...)):
+    return HTMLResponse(
+        f"""
+        <html>
+          <body style="font-family:system-ui,-apple-system,Segoe UI,Roboto,Ubuntu,Arial,sans-serif;padding:32px;">
+            <h2>Reset your Rentonomic password</h2>
+            <form method="post" action="/reset-password" style="max-width:420px;">
+              <input type="hidden" name="email" value="{email}">
+              <input type="hidden" name="token" value="{token}">
+
+              <label>New password</label><br>
+              <input name="password" type="password" required minlength="6" style="width:100%;padding:10px;margin:8px 0 16px;"><br>
+
+              <label>Confirm new password</label><br>
+              <input name="confirm_password" type="password" required minlength="6" style="width:100%;padding:10px;margin:8px 0 16px;"><br>
+
+              <button type="submit" style="background:#1f2937;color:#fff;padding:10px 14px;border:0;border-radius:8px;">Update Password</button>
+            </form>
+          </body>
+        </html>
+        """
+    )
+
+
+@app.post("/reset-password")
+async def reset_password(request: Request):
+    form = await request.form()
+
+    email = str((form.get("email") or "")).lower().strip()
+    token = str(form.get("token") or "")
+    password = str(form.get("password") or "")
+    confirm_password = str(form.get("confirm_password") or "")
+
+    if not email or not token:
+        raise HTTPException(400, "Invalid reset request")
+
+    if not password or len(password) < 6:
+        raise HTTPException(400, "Password too short")
+
+    if password != confirm_password:
+        raise HTTPException(400, "Passwords do not match")
+
+    with get_conn() as conn, conn.cursor(cursor_factory=psycopg2.extras.DictCursor) as cur:
+        cur.execute(
+            """
+            SELECT password_reset_token
+            FROM users
+            WHERE lower(email)=lower(%s)
+            """,
+            (email,),
+        )
+        row = cur.fetchone()
+
+        if not row:
+            raise HTTPException(400, "Invalid reset link")
+
+        stored_token = row["password_reset_token"]
+
+        if not stored_token or stored_token != token:
+            raise HTTPException(400, "Invalid or already used reset link")
+
+        if not verify_password_reset_token(email, token):
+            raise HTTPException(400, "Reset link has expired")
+
+        pw_hash = hashlib.sha256(password.encode()).hexdigest()
+
+        cur.execute(
+            """
+            UPDATE users
+            SET password_hash=%s,
+                password_reset_token=NULL,
+                password_reset_sent_at=NULL
+            WHERE lower(email)=lower(%s)
+            """,
+            (pw_hash, email),
+        )
+        conn.commit()
+
+    return HTMLResponse(
+        f"""
+        <html>
+          <body style="font-family:system-ui,-apple-system,Segoe UI,Roboto,Ubuntu,Arial,sans-serif;padding:32px;">
+            <h2>Password updated</h2>
+            <p>Your Rentonomic password has been updated successfully.</p>
+            <p><a href="{FRONTEND_URL}" style="background:#1f2937;color:#fff;padding:10px 14px;border-radius:8px;text-decoration:none">Return to Rentonomic</a></p>
+          </body>
+        </html>
+        """
+    )
+    
 @app.post("/login")
 async def login(request: Request):
     mode = _extract_email_password_mode(request)
