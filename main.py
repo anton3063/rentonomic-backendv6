@@ -1804,7 +1804,7 @@ def create_checkout_session(data: CheckoutIn, user=Depends(get_current_user)):
         mode="payment",
         success_url=f"{FRONTEND_URL}/dashboard.html",
         cancel_url=f"{FRONTEND_URL}/dashboard.html",
-        payment_method_types=["card", "klarna", "link", "revolut_pay", "amazon_pay"],
+        payment_method_types=["card"],
         currency=data.currency,
         line_items=[
             {
