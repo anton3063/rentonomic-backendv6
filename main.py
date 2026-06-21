@@ -1800,6 +1800,21 @@ def create_checkout_session(data: CheckoutIn, user=Depends(get_current_user)):
         )
         conn.commit()
 
+    with get_conn() as conn, conn.cursor(cursor_factory=psycopg2.extras.DictCursor) as cur:
+        cur.execute(
+            "SELECT status, checkout_session_id FROM rentals WHERE id=%s",
+            (rental_id,)
+        )
+        existing_rental = cur.fetchone()
+
+        if not existing_rental:
+            raise HTTPException(status_code=404, detail="Rental not found")
+
+        if existing_rental["status"] == "paid":
+            raise HTTPException(status_code=400, detail="This rental has already been paid")
+
+        if existing_rental["checkout_session_id"]:
+            raise HTTPException(status_code=400, detail="Payment has already been started for this rental")
     session = stripe.checkout.Session.create(
         mode="payment",
         success_url=f"{FRONTEND_URL}/dashboard.html",
